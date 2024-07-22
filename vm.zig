@@ -1,10 +1,17 @@
-regs: [256]u64 = undefined,
+regs: [256]u64 = b: {
+    var arr: [256]u64 = undefined;
+    arr[0] = 0;
+    break :b arr;
+},
 ip: usize = undefined,
 fuel: usize = 0,
+log_buffer: if (debug) ?*std.ArrayList(u8) else void = if (debug) null,
 
 const std = @import("std");
 const isa = @import("isa.zig");
+const root = @import("root.zig");
 const Self = @This();
+const debug = @import("builtin").mode == .Debug;
 
 const one: u64 = 1;
 
@@ -287,6 +294,15 @@ fn readOp(self: *Self, ctx: anytype) !isa.Op {
     if (std.meta.Child(@TypeOf(ctx)).check_ops and byte > isa.instr_count) {
         return error.InvalidOp;
     }
+
+    @setEvalBranchQuota(2000);
+    if (debug) if (self.log_buffer) |buf| switch (@as(isa.Op, @enumFromInt(byte))) {
+        inline else => |o| buf.writer().print(
+            "{s}: {any}\n",
+            .{ @tagName(o), root.toTuple(try self.progRead(isa.ArgsOf(o), ctx)) },
+        ) catch unreachable,
+    };
+
     return @enumFromInt(byte);
 }
 
@@ -299,7 +315,7 @@ fn progRead(self: *Self, comptime T: type, ctx: anytype) !T {
     return (try ctx.progRead(T, self.ip)).*;
 }
 
-fn testRun(vm: *Self, res: anyerror!isa.Op, regRes: anytype, comptime code: anytype) !void {
+pub fn testRun(vm: *Self, res: anyerror!isa.Op, regRes: anytype, comptime code: anytype) !void {
     const fode = isa.packMany(code);
     vm.ip = @intFromPtr(fode.ptr);
     var ctx = UnsafeCtx{};
@@ -323,7 +339,7 @@ test "sanity" {
         .{.tx},
     });
 
-    try testRun(&vm, .tx, 1, .{
+    try testRun(&vm, .tx, toUnsigned(64, -1), .{
         .{ .li64, 1, 1 },
         .{ .li64, 2, toUnsigned(64, -1) },
         .{ .cmpu, 1, 1, 2 },

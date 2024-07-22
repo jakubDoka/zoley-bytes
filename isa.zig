@@ -41,7 +41,7 @@ pub fn ArgsOf(comptime op: Op) type {
         .fields = &fields,
         .decls = &.{},
         .is_tuple = false,
-        .layout = .@"extern",
+        .layout = .@"packed",
     } });
 }
 
@@ -56,9 +56,9 @@ pub fn pack(comptime op: Op, args: anytype) [instrSize(op)]u8 {
     var out: [instrSize(op)]u8 = undefined;
     out[0] = @intFromEnum(op);
     comptime var i: usize = 1;
-    inline for (std.meta.fields(ArgsOf(op)), 0..) |name, j| {
-        @as(*align(1) name.type, @ptrCast(&out[i])).* = @truncate(args[j]);
-        i += @sizeOf(name.type);
+    inline for (std.meta.fields(ArgsOf(op)), 0..) |field, j| {
+        @as(*align(1) field.type, @ptrCast(&out[i])).* = @truncate(args[j]);
+        i += @sizeOf(field.type);
     }
     return out;
 }
@@ -81,6 +81,32 @@ pub fn packMany(comptime instrs: anytype) []const u8 {
 
     const outa = out;
     return &outa;
+}
+
+pub fn disasm(code: []const u8, out: *std.ArrayList(u8)) !void {
+    @setEvalBranchQuota(2000);
+    var cursor = code;
+    while (cursor.len > 0) {
+        const op: Op = @enumFromInt(cursor[0]);
+        cursor = cursor[1..];
+
+        switch (op) {
+            inline else => |v| {
+                try out.appendSlice(@tagName(v));
+                const args: *align(1) const ArgsOf(v) = @ptrCast(cursor.ptr);
+                const argTys = spec[@intFromEnum(v)].args;
+                inline for (std.meta.fields(ArgsOf(v)), 0..) |field, i| {
+                    if (i > 0) try out.appendSlice(", ") else try out.appendSlice(" ");
+                    switch (argTys[i]) {
+                        .reg => try out.writer().print("${d}", .{@field(args, field.name)}),
+                        else => try out.writer().print("{any}", .{@field(args, field.name)}),
+                    }
+                }
+                try out.appendSlice("\n");
+                cursor = cursor[instrSize(v) - 1 ..];
+            },
+        }
+    }
 }
 
 fn ni(name: [:0]const u8, args: anytype, desc: []const u8) InstrSpec {

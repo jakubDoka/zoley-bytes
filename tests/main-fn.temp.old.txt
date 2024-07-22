@@ -1,0 +1,10 @@
+EXECUTION
+li64: { 1, 42 }
+tx: { }
+
+DISASM
+li64 $1, 42
+tx
+
+REGISTERS
+$1: 42
