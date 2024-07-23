@@ -1,6 +1,13 @@
 const std = @import("std");
 
 pub const instr_count = spec.len;
+pub const max_instr_len = blk: {
+    var max_len: usize = 0;
+    for (spec) |instr| {
+        max_len = @max(max_len, instr.name.len);
+    }
+    break :blk max_len;
+};
 
 pub const Arg = enum { reg, imm8, imm16, imm32, imm64, rel16, rel32, abs64 };
 const InstrSpec = struct { name: [:0]const u8, args: []const Arg, desc: []const u8 };
@@ -86,13 +93,12 @@ pub fn packMany(comptime instrs: anytype) []const u8 {
     return &outa;
 }
 
-pub fn disasmOne(code: []const u8, cursor: usize, labelMap: *std.AutoHashMap(u32, u32), out: *std.ArrayList(u8)) !usize {
-    const label = labelMap.get(@intCast(cursor));
+pub fn disasmOne(code: []const u8, cursor: usize, labelMap: *const std.AutoHashMap(u32, u32), out: *std.ArrayList(u8)) !usize {
     const padding = if (labelMap.count() != 0)
         2 + @max(std.math.log2_int_ceil(usize, labelMap.count()) / 4, 1)
     else
         0;
-    if (label) |l| {
+    if (labelMap.get(@intCast(cursor))) |l| {
         try out.writer().print("{x}: ", .{l});
     } else {
         for (0..padding) |_| try out.append(' ');
@@ -102,6 +108,7 @@ pub fn disasmOne(code: []const u8, cursor: usize, labelMap: *std.AutoHashMap(u32
     switch (op) {
         inline else => |v| {
             try out.appendSlice(@tagName(v));
+            for (@tagName(v).len..max_instr_len) |_| try out.append(' ');
             const argTys = spec[@intFromEnum(v)].args;
             comptime var i: usize = 1;
             inline for (argTys) |argTy| {
@@ -120,7 +127,7 @@ fn disasmArg(
     comptime arg: Arg,
     value: ArgType(arg),
     cursor: i32,
-    labelMap: *std.AutoHashMap(u32, u32),
+    labelMap: *const std.AutoHashMap(u32, u32),
     out: *std.ArrayList(u8),
 ) !void {
     switch (arg) {
@@ -156,10 +163,9 @@ fn makeLabelMap(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(u32, 
                 inline .rel16, .rel32 => |ty| {
                     const arg: *align(1) const ArgType(ty) =
                         @ptrCast(@alignCast(&code[@intCast(cursor)]));
-                    std.debug.print("arg: {any} {any}\n", .{ arg.*, cursor });
                     const pos: u32 = @intCast(cursor_snap + arg.*);
                     _ = @as(Op, @enumFromInt(code[pos]));
-                    try map.put(pos, map.count());
+                    if (map.get(pos) == null) try map.put(pos, map.count());
                     cursor += @sizeOf(@TypeOf(arg.*));
                 },
                 inline else => |ty| cursor += @sizeOf(ArgType(ty)),

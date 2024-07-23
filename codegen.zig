@@ -343,7 +343,7 @@ fn generateFunc(self: *Codegen, comptime entry: bool, id: usize) !void {
 
     if (entry) try self.emit(.tx, .{}) else {
         self.cx.regs.checkLeaks();
-        const poped_regs_size = self.cx.regs.free_count * @as(u16, 8);
+        const poped_regs_size = self.cx.regs.free_count * @as(u16, 8) + 8;
         const stack_size = 0;
 
         self.writeLocalReloc(u64, 3, 0 -% @as(u64, poped_regs_size + stack_size));
