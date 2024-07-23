@@ -4,6 +4,11 @@ test {
     _ = @import("codegen.zig");
 }
 
+pub fn isErr(value: anytype) bool {
+    value catch return true;
+    return false;
+}
+
 pub fn findReadmeSnippet(comptime name: []const u8) ![]const u8 {
     var readme: []const u8 = @embedFile("README.md");
     const headingPat = "#### " ++ name ++ "\n```hb";
@@ -20,8 +25,8 @@ pub fn TaggedIndex(comptime R: type, comptime T: type) type {
         tag_bits: std.meta.Tag(T),
         index: std.meta.Int(.unsigned, @bitSizeOf(R) - @bitSizeOf(T)),
 
-        const Tag = T;
-        const Repr = R;
+        pub const Tag = T;
+        pub const Repr = R;
 
         pub fn init(tag_bits: T, index: usize) @This() {
             return .{ .tag_bits = @intFromEnum(tag_bits), .index = @intCast(index) };

@@ -15,23 +15,43 @@ pub const Lexeme = enum(u8) {
     @":" = ':',
     @";" = ';',
     @"," = ',',
-    Ident,
+    @"-" = '-',
+    @"+" = '+',
+    @"*" = '*',
+    @"/" = '/',
+    @"<" = '<',
+    Ident = 128,
+    Comment,
     Integer,
     @"fn",
     @"return",
+    @"if",
+    @"else",
+    bool,
     int,
     void,
     @":=" = ':' + 128,
+    @"<=" = '<' + 128,
 
     pub fn precedence(self: Lexeme) u8 {
         return switch (self) {
             .@":=" => 15,
+            .@"<", .@"<=" => 6,
+            .@"+", .@"-" => 4,
+            .@"*", .@"/" => 3,
             else => 255,
         };
     }
 
     pub fn repr(self: Lexeme) []const u8 {
         return @tagName(self);
+    }
+
+    pub fn cantStartExpression(self: Lexeme) bool {
+        return switch (self) {
+            .@"}", .@";", .@",", .@")" => true,
+            else => false,
+        };
     }
 };
 
@@ -83,13 +103,37 @@ pub fn next(self: *Lexer) Token {
                 };
                 break :b .Integer;
             },
-            ':' => |c| @enumFromInt(if (self.advanceIf('=')) c + 128 else c),
+            '/' => |c| if (self.advanceIf('*')) ml: {
+                var nesting: u8 = 1;
+                while (nesting > 0) switch (self.advance() orelse break) {
+                    '/' => if (self.advanceIf('*')) {
+                        nesting += 1;
+                    },
+                    '*' => if (self.advanceIf('/')) {
+                        nesting -= 1;
+                    },
+                    else => {},
+                };
+                break :ml .Comment;
+            } else if (self.advanceIf('/')) l: {
+                while (self.advance()) |ch| if (ch == '\n') break;
+                break :l .Comment;
+            } else @enumFromInt(c),
+            ':', '<' => |c| @enumFromInt(if (self.advanceIf('=')) c + 128 else c),
             else => |c| @enumFromInt(c),
         };
         return Token.init(pos, self.cursor, kind);
     }
 
     return Token.init(self.cursor, self.cursor, .Eof);
+}
+
+inline fn advance(self: *Lexer) ?u8 {
+    if (self.cursor < self.source.len) {
+        defer self.cursor += 1;
+        return self.source[self.cursor];
+    }
+    return null;
 }
 
 inline fn advanceIf(self: *Lexer, c: u8) bool {

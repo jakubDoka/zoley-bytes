@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const instr_count = spec.len;
 
-const Arg = enum { reg, imm8, imm16, imm32, imm64, rel16, rel32, abs64 };
+pub const Arg = enum { reg, imm8, imm16, imm32, imm64, rel16, rel32, abs64 };
 const InstrSpec = struct { name: [:0]const u8, args: []const Arg, desc: []const u8 };
 
 pub fn ArgType(comptime arg: Arg) type {
@@ -57,7 +57,10 @@ pub fn pack(comptime op: Op, args: anytype) [instrSize(op)]u8 {
     out[0] = @intFromEnum(op);
     comptime var i: usize = 1;
     inline for (std.meta.fields(ArgsOf(op)), 0..) |field, j| {
-        @as(*align(1) field.type, @ptrCast(&out[i])).* = @truncate(args[j]);
+        if (std.meta.fields(@TypeOf(args)).len <= j)
+            @compileError("too few args " ++ @tagName(op));
+        @as(*align(1) field.type, @ptrCast(&out[i])).* =
+            if (@sizeOf(@TypeOf(args[j])) > @sizeOf(field.type)) @truncate(args[j]) else args[j];
         i += @sizeOf(field.type);
     }
     return out;
@@ -83,30 +86,87 @@ pub fn packMany(comptime instrs: anytype) []const u8 {
     return &outa;
 }
 
-pub fn disasm(code: []const u8, out: *std.ArrayList(u8)) !void {
-    @setEvalBranchQuota(2000);
-    var cursor = code;
-    while (cursor.len > 0) {
-        const op: Op = @enumFromInt(cursor[0]);
-        cursor = cursor[1..];
+pub fn disasmOne(code: []const u8, cursor: usize, labelMap: *std.AutoHashMap(u32, u32), out: *std.ArrayList(u8)) !usize {
+    const label = labelMap.get(@intCast(cursor));
+    const padding = if (labelMap.count() != 0)
+        2 + @max(std.math.log2_int_ceil(usize, labelMap.count()) / 4, 1)
+    else
+        0;
+    if (label) |l| {
+        try out.writer().print("{x}: ", .{l});
+    } else {
+        for (0..padding) |_| try out.append(' ');
+    }
 
-        switch (op) {
-            inline else => |v| {
-                try out.appendSlice(@tagName(v));
-                const args: *align(1) const ArgsOf(v) = @ptrCast(cursor.ptr);
-                const argTys = spec[@intFromEnum(v)].args;
-                inline for (std.meta.fields(ArgsOf(v)), 0..) |field, i| {
-                    if (i > 0) try out.appendSlice(", ") else try out.appendSlice(" ");
-                    switch (argTys[i]) {
-                        .reg => try out.writer().print("${d}", .{@field(args, field.name)}),
-                        else => try out.writer().print("{any}", .{@field(args, field.name)}),
-                    }
-                }
-                try out.appendSlice("\n");
-                cursor = cursor[instrSize(v) - 1 ..];
-            },
+    const op: Op = @enumFromInt(code[0]);
+    switch (op) {
+        inline else => |v| {
+            try out.appendSlice(@tagName(v));
+            const argTys = spec[@intFromEnum(v)].args;
+            comptime var i: usize = 1;
+            inline for (argTys) |argTy| {
+                if (i > 1) try out.appendSlice(", ") else try out.appendSlice(" ");
+                const arg: *align(1) const ArgType(argTy) = @ptrCast(@alignCast(&code[i]));
+                try disasmArg(argTy, arg.*, @intCast(cursor), labelMap, out);
+                i += @sizeOf(@TypeOf(arg.*));
+            }
+            try out.appendSlice("\n");
+            return i;
+        },
+    }
+}
+
+fn disasmArg(
+    comptime arg: Arg,
+    value: ArgType(arg),
+    cursor: i32,
+    labelMap: *std.AutoHashMap(u32, u32),
+    out: *std.ArrayList(u8),
+) !void {
+    switch (arg) {
+        .rel16, .rel32 => {
+            const pos: u32 = @intCast(cursor + value);
+            const label = labelMap.get(pos).?;
+            try out.writer().print(":{x}", .{label});
+        },
+        .reg => try out.writer().print("${d}", .{value}),
+        else => try out.writer().print("{any}", .{value}),
+    }
+}
+
+pub fn disasm(code: []const u8, out: *std.ArrayList(u8)) !void {
+    var labelMap = try makeLabelMap(code, out.allocator);
+    defer labelMap.deinit();
+    var cursor: usize = 0;
+    while (code.len > cursor) {
+        cursor += try disasmOne(code[cursor..], cursor, &labelMap, out);
+    }
+}
+
+fn makeLabelMap(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(u32, u32) {
+    var map = std.AutoHashMap(u32, u32).init(gpa);
+    var cursor: i32 = 0;
+    while (code.len > cursor) {
+        const cursor_snap = cursor;
+        const op: Op = @enumFromInt(code[@intCast(cursor)]);
+        cursor += 1;
+        const args = spec[@intFromEnum(op)].args;
+        for (args) |argTy| {
+            switch (argTy) {
+                inline .rel16, .rel32 => |ty| {
+                    const arg: *align(1) const ArgType(ty) =
+                        @ptrCast(@alignCast(&code[@intCast(cursor)]));
+                    std.debug.print("arg: {any} {any}\n", .{ arg.*, cursor });
+                    const pos: u32 = @intCast(cursor_snap + arg.*);
+                    _ = @as(Op, @enumFromInt(code[pos]));
+                    try map.put(pos, map.count());
+                    cursor += @sizeOf(@TypeOf(arg.*));
+                },
+                inline else => |ty| cursor += @sizeOf(ArgType(ty)),
+            }
         }
     }
+    return map;
 }
 
 fn ni(name: [:0]const u8, args: anytype, desc: []const u8) InstrSpec {
@@ -145,7 +205,7 @@ fn nsiop(name: [:0]const u8, op: []const u8) [4]InstrSpec {
 }
 
 fn nsimop(name: [:0]const u8, op: []const u8) [4]InstrSpec {
-    return nsi(name, breg, true, bdescm(op));
+    return nsi(name, .{ .reg, .reg }, true, bdescm(op));
 }
 
 fn nfsiop(name: [:0]const u8, op: []const u8) [2]InstrSpec {
@@ -154,7 +214,7 @@ fn nfsiop(name: [:0]const u8, op: []const u8) [2]InstrSpec {
 
 const cmp_mapping = " < => -1 : = => 0 : > => 1";
 
-const spec = .{
+pub const spec = .{
     ni("un", .{}, "unreachable code reached"),
     ni("tx", .{}, "gracefully end execution"),
     ni("nop", .{}, "no operation"),
@@ -205,6 +265,8 @@ const spec = .{
     ni("jmp", .{.rel32}, "pc += #1"),
     ni("jal", .{ .reg, .reg, .rel32 }, "pc += #1"),
     ni("jala", .{ .reg, .reg, .abs64 }, "pc += #1"),
+    ni("jeq", .{ .reg, .reg, .rel16 }, "Branch on equal"),
+    ni("jne", .{ .reg, .reg, .rel16 }, "Branch on not equal"),
     ni("jltu", .{ .reg, .reg, .rel16 }, "Branch on lesser-than (unsigned)"),
     ni("jgtu", .{ .reg, .reg, .rel16 }, "Branch on greater-than (unsigned)"),
     ni("jlts", .{ .reg, .reg, .rel16 }, "Branch on lesser-than (signed)"),
