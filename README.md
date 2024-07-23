@@ -57,3 +57,13 @@ fib := fn(x: int): int {
     }
 }
 ```
+
+#### variables
+```hb
+main := fn(): int {
+	ඞ := 1
+	b := 2
+	ඞ += 1
+	return ඞ - b
+}
+```

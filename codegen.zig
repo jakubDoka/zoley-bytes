@@ -852,3 +852,7 @@ test "comments" {
 test "if-statements" {
     try testSnippet("if-statements");
 }
+
+test "variables" {
+    try testSnippet("variables");
+}
