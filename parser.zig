@@ -2,8 +2,10 @@ exprs: Store,
 path: []const u8,
 source: []const u8,
 items: Slice,
+decls: []const Decl,
 
 const std = @import("std");
+const root = @import("root.zig");
 const Lexer = @import("lexer.zig");
 const Ast = @This();
 const IdRepr = u32;
@@ -13,20 +15,18 @@ pub const Slice = EnumSlice(Kind);
 
 pub const Ident = packed struct(Ident.Repr) {
     const Repr = u32;
-    const Len = u6;
+    index: u30,
+    referenced: bool = false,
+    last: bool = false,
 
-    index: std.meta.Int(.unsigned, @bitSizeOf(Repr) - @bitSizeOf(Len)),
-    len: Len,
-
-    pub fn init(token: Lexer.Token) !Ident {
-        if (token.end - token.pos > std.math.maxInt(Len)) return error.TooLongIdent;
-        return .{ .index = @intCast(token.pos), .len = @intCast(token.end - token.pos) };
-    }
-
-    pub fn view(self: Ident, source: []const u8) []const u8 {
-        return source[self.index..][0..self.len];
+    pub fn init(token: Lexer.Token) Ident {
+        return .{ .index = @intCast(token.pos) };
     }
 };
+
+pub fn cmp(pos: u32, source: []const u8, repr: []const u8) bool {
+    return std.mem.eql(u8, Lexer.peekStr(source, pos), repr);
+}
 
 pub const Kind = enum {
     Void,
@@ -34,11 +34,20 @@ pub const Kind = enum {
     Ident,
     Buty,
     Fn,
+    Struct,
     Arg,
     Call,
+    Field,
+    Ctor,
+    CtorField,
+    Tupl,
     If,
+    Loop,
+    Break,
+    Continue,
     Return,
     Block,
+    UnOp,
     BinOp,
     Integer,
 };
@@ -60,6 +69,10 @@ pub const Expr = union(Kind) {
         ret: Id,
         body: Id,
     },
+    Struct: struct {
+        pos: Pos,
+        fields: Slice,
+    },
     Arg: struct {
         bindings: Id,
         ty: Id,
@@ -69,12 +82,36 @@ pub const Expr = union(Kind) {
         arg_pos: Pos,
         args: Slice,
     },
+    Field: struct {
+        base: Id,
+        field: Pos,
+    },
+    Ctor: struct {
+        pos: Pos,
+        ty: Id,
+        fields: Slice,
+    },
+    CtorField: struct {
+        pos: Pos,
+        value: Id,
+    },
+    Tupl: struct {
+        pos: Pos,
+        ty: Id,
+        fields: Slice,
+    },
     If: struct {
         pos: Pos,
         cond: Id,
         body: Id,
         else_: Id,
     },
+    Loop: struct {
+        pos: Pos,
+        body: Id,
+    },
+    Break: Pos,
+    Continue: Pos,
     Return: struct {
         pos: Pos,
         value: Id,
@@ -82,6 +119,11 @@ pub const Expr = union(Kind) {
     Block: struct {
         pos: Pos,
         stmts: Slice,
+    },
+    UnOp: struct {
+        pos: Pos,
+        op: Lexer.Lexeme,
+        oper: Id,
     },
     BinOp: struct {
         lhs: Id,
@@ -102,26 +144,65 @@ pub const Pos = packed struct(Pos.Repr) {
     }
 };
 
-const Sym = struct {
-    id: Ident,
+pub const Decl = struct {
+    name: Ident,
+    expr: Id,
 };
 
 const Parser = struct {
     store: Store = .{},
-    cur: Lexer.Token,
-    lexer: Lexer,
-    list_pos: Pos = undefined,
-    arena: std.heap.ArenaAllocator,
-    gpa: std.mem.Allocator,
-    syms: std.ArrayListUnmanaged(Sym) = .{},
+    decls: []Decl = &.{},
 
-    const Error = error{ TooLongIdent, UnexpectedToken } || std.mem.Allocator.Error;
+    gpa: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+
+    active_syms: std.ArrayListUnmanaged(Sym) = .{},
+    all_sym_decls: std.ArrayListUnmanaged(u16) = .{},
+    all_sym_occurences: std.ArrayListUnmanaged(Id) = .{},
+
+    lexer: Lexer,
+    cur: Lexer.Token,
+    list_pos: Pos = undefined,
+    undeclared_count: u32 = 0,
+    block_depth: u32 = 0,
+
+    const Error = error{UnexpectedToken} || std.mem.Allocator.Error;
+
+    const Sym = struct {
+        id: Ident,
+        undeclared_count: u32,
+        sym_decl: u32,
+        first: Id,
+        last: Id,
+        decl: Id = Id.zeroSized(.Void),
+    };
 
     fn parse(self: *Parser) !Slice {
         var itemBuf = std.ArrayListUnmanaged(Id){};
         while (self.cur.kind != .Eof) {
             try itemBuf.append(self.arena.allocator(), try self.parseExpr());
+            _ = self.tryAdvance(.@";");
         }
+
+        self.undeclared_count = 0;
+        const remining = self.finalizeVariablesLow(0);
+        self.decls = try self.gpa.alloc(Decl, self.active_syms.items.len);
+        for (self.active_syms.items, self.decls) |s, *d| d.* = .{
+            .name = s.id,
+            .expr = s.decl,
+        };
+        for (self.all_sym_occurences.items) |id| {
+            const ident = self.store.getTypedPtr(.Ident, id).?;
+            ident.id.index = self.all_sym_decls.items[ident.id.index];
+        }
+        for (self.active_syms.items[0..remining]) |s| {
+            std.debug.print(
+                "undefined identifier: {s}\n",
+                .{Lexer.peekStr(self.lexer.source, s.id.index)},
+            );
+        }
+        std.debug.assert(remining == 0);
+
         return self.store.allocSlice(self.gpa, itemBuf.items);
     }
 
@@ -136,6 +217,8 @@ const Parser = struct {
             const prec = op.precedence();
             if (prec >= prevPrec) break;
 
+            const to_decl = if (op == .@":=") self.declareExpr(acum) else null;
+
             self.cur = self.lexer.next();
             const rhs = try self.parseBinExpr(try self.parseUnit(), prec);
             acum = try self.store.alloc(
@@ -143,45 +226,115 @@ const Parser = struct {
                 .BinOp,
                 .{ .lhs = acum, .op = op, .rhs = rhs },
             );
+            if (to_decl) |decl| self.active_syms.items[decl].decl = acum;
         }
         return acum;
     }
 
+    fn declareExpr(self: *Parser, id: Id) u32 {
+        const ident = self.store.getTypedPtr(.Ident, id).?;
+        const sym_idx = self.all_sym_decls.items[ident.id.index];
+        const sym = &self.active_syms.items[sym_idx];
+        if (!std.mem.eql(
+            u8,
+            Lexer.peekStr(self.lexer.source, ident.pos.index),
+            Lexer.peekStr(self.lexer.source, sym.id.index),
+        )) {
+            std.debug.panic(
+                "somehow the identifier and sym do not match: {s} {s}",
+                .{
+                    Lexer.peekStr(self.lexer.source, ident.pos.index),
+                    Lexer.peekStr(self.lexer.source, sym.id.index),
+                },
+            );
+        }
+        if (self.block_depth != 0) {
+            self.undeclared_count -= 1;
+            sym.undeclared_count = self.undeclared_count;
+            if (!sym.id.last and !std.meta.eql(id, sym.first))
+                std.debug.panic("out of order local variable", .{});
+        }
+        sym.id.last = true;
+        return sym_idx;
+    }
+
     fn parseUnit(self: *Parser) Error!Id {
-        var root = try self.parseUnitWithoutTail();
-        while (true) root = try self.store.allocDyn(self.gpa, switch (self.cur.kind) {
+        var base = try self.parseUnitWithoutTail();
+        while (true) base = try self.store.allocDyn(self.gpa, switch (self.cur.kind) {
+            .@"." => .{ .Field = .{
+                .base = base,
+                .field = b: {
+                    _ = self.advance();
+                    break :b Pos.init((try self.expectAdvance(.Ident)).pos);
+                },
+            } },
             .@"(" => .{ .Call = .{
-                .called = root,
+                .called = base,
                 .args = try self.parseList(.@"(", .@",", .@")", parseExpr),
                 .arg_pos = self.list_pos,
             } },
+            .@".{" => .{ .Ctor = .{
+                .ty = base,
+                .fields = try self.parseList(.@".{", .@",", .@"}", parseCtorField),
+                .pos = self.list_pos,
+            } },
+            .@".(" => .{ .Tupl = .{
+                .ty = base,
+                .fields = try self.parseList(.@".(", .@",", .@")", parseExpr),
+                .pos = self.list_pos,
+            } },
             else => break,
         });
-        _ = self.tryAdvance(.@";");
-        return root;
+        return base;
     }
 
     fn parseUnitWithoutTail(self: *Parser) Error!Id {
         const token = self.advance();
+        const scope_frame = self.active_syms.items.len;
         return try self.store.allocDyn(self.gpa, switch (token.kind) {
             .Comment => .{ .Comment = Pos.init(token.pos) },
-            .Ident => .{ .Ident = try self.resolveIdent(token) },
+            .Ident => return try self.resolveIdent(token),
             .@"fn" => .{ .Fn = .{
-                .args = try self.parseList(.@"(", .@",", .@")", parseArg),
+                .args = p: {
+                    self.block_depth += 1;
+                    defer self.block_depth -= 1;
+                    break :p try self.parseList(.@"(", .@",", .@")", parseArg);
+                },
                 .pos = self.list_pos,
                 .ret = b: {
                     _ = try self.expectAdvance(.@":");
                     break :b try self.parseExpr();
                 },
-                .body = try self.parseExpr(),
+                .body = b: {
+                    defer self.finalizeVariables(scope_frame);
+                    break :b try self.parseExpr();
+                },
+            } },
+            .@"struct" => .{ .Struct = .{
+                .fields = try self.parseList(.@"{", .@",", .@"}", parseField),
+                .pos = self.list_pos,
+            } },
+            .@".{" => .{ .Ctor = .{
+                .ty = Id.zeroSized(.Void),
+                .fields = try self.parseList(.@".{", .@",", .@"}", parseCtorField),
+                .pos = self.list_pos,
+            } },
+            .@".(" => .{ .Tupl = .{
+                .ty = Id.zeroSized(.Void),
+                .fields = try self.parseList(.@".(", .@",", .@")", parseExpr),
+                .pos = self.list_pos,
             } },
             .@"{" => .{ .Block = .{
                 .pos = Pos.init(token.pos),
                 .stmts = b: {
+                    self.block_depth += 1;
+                    defer self.block_depth -= 1;
                     var buf = std.ArrayListUnmanaged(Id){};
                     while (!self.tryAdvance(.@"}")) {
                         try buf.append(self.arena.allocator(), try self.parseExpr());
+                        _ = self.tryAdvance(.@";");
                     }
+                    self.finalizeVariables(scope_frame);
                     break :b try self.store.allocSlice(self.gpa, buf.items);
                 },
             } },
@@ -191,6 +344,15 @@ const Parser = struct {
                 return expr;
             },
             .int, .void => .{ .Buty = .{ .pos = Pos.init(token.pos), .bt = token.kind } },
+            .@"&", .@"*", .@"^" => |op| .{ .UnOp = .{
+                .pos = Pos.init(token.pos),
+                .op = op,
+                .oper = b: {
+                    const oper = try self.parseUnit();
+                    if (op == .@"&") self.markIdent(oper, "referenced");
+                    break :b oper;
+                },
+            } },
             .@"if" => .{ .If = .{
                 .pos = Pos.init(token.pos),
                 .cond = try self.parseExpr(),
@@ -200,6 +362,12 @@ const Parser = struct {
                 else
                     Id.zeroSized(.Void),
             } },
+            .loop => .{ .Loop = .{
+                .pos = Pos.init(token.pos),
+                .body = try self.parseExpr(),
+            } },
+            .@"break" => .{ .Break = Pos.init(token.pos) },
+            .@"continue" => .{ .Continue = Pos.init(token.pos) },
             .@"return" => .{ .Return = .{
                 .pos = Pos.init(token.pos),
                 .value = if (self.cur.kind.cantStartExpression())
@@ -212,19 +380,68 @@ const Parser = struct {
         });
     }
 
-    fn resolveIdent(self: *Parser, token: Lexer.Token) !std.meta.TagPayload(Expr, .Ident) {
+    fn markIdent(self: *Parser, expr: Id, comptime flag: []const u8) void {
+        switch (self.store.get(expr)) {
+            .Ident => |i| {
+                const sym_idx = self.all_sym_decls.items[i.id.index];
+                @field(self.active_syms.items[sym_idx].id, flag) = true;
+            },
+            else => {},
+        }
+    }
+
+    fn finalizeVariablesLow(self: *Parser, start: usize) usize {
+        var new_len = start;
+        for (self.active_syms.items[start..], start..) |*s, i| {
+            if (s.id.last) {
+                self.all_sym_decls.items[s.sym_decl] = @intCast(i - s.undeclared_count);
+                const first_ident = self.store.getTypedPtr(.Ident, s.first).?;
+                var first_ident_id = s.id;
+                first_ident_id.last = false;
+                first_ident_id.index = @intCast(s.sym_decl);
+                first_ident.id = first_ident_id;
+                self.store.getTypedPtr(.Ident, s.last).?.id.last = true;
+            } else {
+                self.all_sym_decls.items[s.sym_decl] = @intCast(new_len);
+                self.active_syms.items[new_len] = s.*;
+                new_len += 1;
+            }
+        }
+        return new_len;
+    }
+
+    fn finalizeVariables(self: *Parser, start: usize) void {
+        self.active_syms.items.len = self.finalizeVariablesLow(start);
+    }
+
+    fn resolveIdent(self: *Parser, token: Lexer.Token) !Id {
         const repr = token.view(self.lexer.source);
 
-        const index = for (self.syms.items, 0..) |*s, i| {
-            if (std.mem.eql(u8, s.id.view(self.lexer.source), repr)) break i;
-        } else b: {
-            try self.syms.append(self.gpa, .{ .id = try Ident.init(token) });
-            break :b self.syms.items.len - 1;
+        for (self.active_syms.items) |*s| if (cmp(s.id.index, self.lexer.source, repr)) {
+            s.last = try self.store.alloc(self.gpa, .Ident, .{
+                .pos = Pos.init(token.pos),
+                .id = .{ .index = @intCast(s.sym_decl) },
+            });
+            try self.all_sym_occurences.append(self.gpa, s.last);
+            return s.last;
         };
 
-        const sym = &self.syms.items[index];
-
-        return .{ .pos = Pos.init(token.pos), .id = sym.id };
+        const id = Ident{ .index = @intCast(token.pos) };
+        const alloc = try self.store.alloc(self.gpa, .Ident, .{
+            .pos = Pos.init(token.pos),
+            .id = .{ .index = @intCast(self.all_sym_decls.items.len) },
+        });
+        try self.all_sym_occurences.append(self.gpa, alloc);
+        try self.all_sym_decls.append(self.gpa, @intCast(self.active_syms.items.len));
+        try self.active_syms.append(self.gpa, .{
+            .id = id,
+            .undeclared_count = 0,
+            .first = alloc,
+            .last = alloc,
+            .sym_decl = @intCast(self.all_sym_decls.items.len - 1),
+        });
+        self.undeclared_count += 1;
+        return alloc;
     }
 
     fn parseList(
@@ -250,12 +467,33 @@ const Parser = struct {
     }
 
     fn parseArg(self: *Parser) Error!Id {
+        const bindings = try self.parseUnitWithoutTail();
+        self.active_syms.items[self.declareExpr(bindings)].decl = bindings;
+        _ = try self.expectAdvance(.@":");
         return try self.store.alloc(self.gpa, .Arg, .{
-            .bindings = try self.parseUnitWithoutTail(),
-            .ty = b: {
-                _ = try self.expectAdvance(.@":");
-                break :b try self.parseExpr();
-            },
+            .bindings = bindings,
+            .ty = try self.parseExpr(),
+        });
+    }
+
+    fn parseField(self: *Parser) Error!Id {
+        const name = try self.expectAdvance(.Ident);
+        _ = try self.expectAdvance(.@":");
+        return try self.store.alloc(self.gpa, .CtorField, .{
+            .pos = Pos.init(name.pos),
+            .value = try self.parseExpr(),
+        });
+    }
+
+    fn parseCtorField(self: *Parser) Error!Id {
+        const name_tok = try self.expectAdvance(.Ident);
+        const value = if (self.tryAdvance(.@":"))
+            try self.parseExpr()
+        else
+            try self.resolveIdent(name_tok);
+        return try self.store.alloc(self.gpa, .CtorField, .{
+            .pos = Pos.init(name_tok.pos),
+            .value = value,
         });
     }
 
@@ -330,7 +568,7 @@ const Fmt = struct {
                 const content = std.mem.trimRight(u8, comment_token.view(self.ast.source), "\n");
                 try self.buf.appendSlice(content);
             },
-            .Ident => |i| try self.buf.appendSlice(i.id.view(self.ast.source)),
+            .Ident => |i| try self.buf.appendSlice(Lexer.peekStr(self.ast.source, i.pos.index)),
             .Fn => |f| {
                 try self.buf.appendSlice("fn");
                 try self.fmtSlice(f.pos.indented, f.args, .@"(", .@",", .@")");
@@ -338,6 +576,11 @@ const Fmt = struct {
                 try self.fmtExpr(f.ret);
                 try self.buf.appendSlice(" ");
                 try self.fmtExpr(f.body);
+            },
+            .Struct => |s| {
+                try self.buf.appendSlice("struct");
+                if (s.pos.indented) try self.buf.appendSlice(" ");
+                try self.fmtSlice(s.pos.indented, s.fields, .@"{", .@",", .@"}");
             },
             .Arg => |a| {
                 try self.fmtExpr(a.bindings);
@@ -347,6 +590,28 @@ const Fmt = struct {
             .Call => |c| {
                 try self.fmtExpr(c.called);
                 try self.fmtSlice(c.arg_pos.indented, c.args, .@"(", .@",", .@")");
+            },
+            .Field => |f| {
+                try self.fmtExpr(f.base);
+                try self.buf.appendSlice(".");
+                try self.buf.appendSlice(Lexer.peekStr(self.ast.source, f.field.index));
+            },
+            inline .Ctor, .Tupl => |v, t| {
+                try self.fmtExpr(v.ty);
+                const start = if (t == .Ctor) .@".{" else .@".(";
+                const end = if (t == .Ctor) .@"}" else .@")";
+                try self.fmtSlice(v.pos.indented, v.fields, start, .@",", end);
+            },
+            .CtorField => |f| {
+                try self.buf.appendSlice(Lexer.peekStr(self.ast.source, f.pos.index));
+                if (self.ast.exprs.getTyped(.Ident, f.value)) |ident|
+                    if (std.mem.eql(
+                        u8,
+                        Lexer.peekStr(self.ast.source, ident.pos.index),
+                        Lexer.peekStr(self.ast.source, f.pos.index),
+                    )) return;
+                try self.buf.appendSlice(": ");
+                try self.fmtExpr(f.value);
             },
             .Buty => |b| try self.buf.appendSlice(b.bt.repr()),
             .Block => |b| {
@@ -377,12 +642,25 @@ const Fmt = struct {
                     try self.fmtExpr(i.else_);
                 }
             },
+            .Loop => |l| {
+                try self.buf.appendSlice("loop ");
+                try self.fmtExpr(l.body);
+            },
+            .Break => try self.buf.appendSlice("break"),
+            .Continue => try self.buf.appendSlice("continue"),
             .Return => |r| {
                 try self.buf.appendSlice("return");
                 if (r.value.tag() != .Void) {
                     try self.buf.appendSlice(" ");
                     try self.fmtExpr(r.value);
                 }
+            },
+            .UnOp => |o| {
+                const unprec = 1;
+                if (prec < unprec) try self.buf.appendSlice("(");
+                try self.buf.appendSlice(o.op.repr());
+                try self.fmtExprPrec(o.oper, unprec);
+                if (prec < unprec) try self.buf.appendSlice(")");
             },
             .BinOp => |o| {
                 if (prec < o.op.precedence()) try self.buf.appendSlice("(");
@@ -420,7 +698,10 @@ const Fmt = struct {
         for (view, 0..) |id, i| {
             if (indent) for (0..self.indent) |_| try self.buf.appendSlice("    ");
             try self.fmtExpr(id);
-            if (indent or i != view.len - 1) try self.buf.appendSlice(sep.repr());
+            if (indent or i != view.len - 1) {
+                try self.buf.appendSlice(sep.repr());
+                if (!indent) try self.buf.appendSlice(" ");
+            }
             if (indent) try self.buf.appendSlice("\n");
         }
 
@@ -444,12 +725,18 @@ pub fn init(path: []const u8, code: []const u8, gpa: std.mem.Allocator) !Ast {
     };
     defer {
         parser.arena.deinit();
-        parser.syms.deinit(gpa);
+        parser.active_syms.deinit(gpa);
+        parser.all_sym_decls.deinit(gpa);
+        parser.all_sym_occurences.deinit(gpa);
     }
-    errdefer parser.store.deinit(gpa);
+    errdefer {
+        parser.store.deinit(gpa);
+        gpa.free(parser.decls);
+    }
 
     return .{
         .items = try parser.parse(),
+        .decls = parser.decls,
         .exprs = parser.store,
         .source = code,
         .path = path,
@@ -471,6 +758,7 @@ pub fn posOf(self: *const Ast, id: Id) Pos {
 
 pub fn deinit(self: *Ast, gpa: std.mem.Allocator) void {
     self.exprs.deinit(gpa);
+    gpa.free(self.decls);
 }
 
 pub fn fmt(self: *const Ast, buf: *std.ArrayList(u8)) !void {
@@ -566,7 +854,7 @@ fn EnumStore(comptime SelfId: type, comptime SelfSlice: type, comptime T: type) 
 
         fn allocLow(self: *Self, gpa: std.mem.Allocator, comptime E: type, count: usize) ![]E {
             const alignment: usize = @alignOf(E);
-            const padded_len = (self.store.items.len + alignment - 1) & ~(alignment - 1);
+            const padded_len = root.alignTo(self.store.items.len, alignment);
             const required_space = padded_len + @sizeOf(E) * count;
             try self.store.resize(gpa, required_space);
             const dest: [*]E = @ptrCast(@alignCast(self.store.items.ptr[padded_len..]));
@@ -592,6 +880,17 @@ fn EnumStore(comptime SelfId: type, comptime SelfSlice: type, comptime T: type) 
             const Value = std.meta.TagPayload(T, tag);
             const loc: *Value = @ptrCast(@alignCast(&self.store.items[id.index]));
             return loc.*;
+        }
+
+        pub fn getTypedPtr(
+            self: *Self,
+            comptime tag: std.meta.Tag(T),
+            id: SelfId,
+        ) ?*std.meta.TagPayload(T, tag) {
+            if (tag != id.tag()) return null;
+            const Value = std.meta.TagPayload(T, tag);
+            const loc: *Value = @ptrCast(@alignCast(&self.store.items[id.index]));
+            return loc;
         }
 
         pub fn view(self: *const Self, slice: SelfSlice) []SelfId {

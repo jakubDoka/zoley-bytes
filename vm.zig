@@ -142,8 +142,8 @@ pub fn run(self: *Self, ctx: anytype) !isa.Op {
             const args = try self.readArgs(.bmc, ctx);
             try ctx.memmove(self.regs[args.arg0], self.regs[args.arg1], args.arg2);
         },
-        .brm => {
-            const args = try self.readArgs(.brm, ctx);
+        .brc => {
+            const args = try self.readArgs(.brc, ctx);
             const dst = self.regs[args.arg0..][0..args.arg2];
             const src = self.regs[args.arg1..][0..args.arg2];
             if (args.arg0 <= args.arg1) {
@@ -152,8 +152,10 @@ pub fn run(self: *Self, ctx: anytype) !isa.Op {
                 std.mem.copyBackwards(u64, dst, src);
             }
         },
-        inline .jmp, .jmp16 => |op| self.ip +%=
-            toUnsigned(64, (try self.readArgs(op, ctx)).arg0) -% isa.instrSize(op),
+        inline .jmp, .jmp16 => |op| {
+            const args = try self.readArgs(op, ctx);
+            self.ip +%= toUnsigned(64, args.arg0) -% isa.instrSize(op);
+        },
         inline .jal, .jala => |op| {
             const args = try self.readArgs(op, ctx);
             if (args.arg0 != 0) self.writeReg(args.arg0, self.ip);
@@ -268,7 +270,7 @@ inline fn idivOp(self: *Self, comptime base: isa.Op, comptime op: isa.Op, ctx: a
     }
 }
 
-inline fn toSigned(comptime width: u16, value: std.meta.Int(.unsigned, width)) std.meta.Int(.signed, width) {
+pub inline fn toSigned(comptime width: u16, value: std.meta.Int(.unsigned, width)) std.meta.Int(.signed, width) {
     return @bitCast(value);
 }
 

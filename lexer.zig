@@ -15,11 +15,16 @@ pub const Lexeme = enum(u8) {
     @":" = ':',
     @";" = ';',
     @"," = ',',
+    @"." = '.',
+    @"&" = '&',
+    @"^" = '^',
+    @"!" = '!',
     @"-" = '-',
     @"+" = '+',
     @"*" = '*',
     @"/" = '/',
     @"<" = '<',
+    @"=" = '=',
     Ident = 128,
     Comment,
     Integer,
@@ -27,18 +32,29 @@ pub const Lexeme = enum(u8) {
     @"return",
     @"if",
     @"else",
+    loop,
+    @"break",
+    @"continue",
+    @"struct",
+    @".{",
+    @".(",
     bool,
     int,
     void,
+    @"+=" = '+' + 128,
+    @"-=" = '-' + 128,
     @":=" = ':' + 128,
+    @"==" = '=' + 128,
+    @"!=" = '!' + 128,
     @"<=" = '<' + 128,
 
     pub fn precedence(self: Lexeme) u8 {
         return switch (self) {
-            .@":=" => 15,
-            .@"<", .@"<=" => 6,
+            .@"=", .@":=", .@"+=", .@"-=" => 15,
+            .@"<", .@"<=", .@"==", .@"!=" => 6,
             .@"+", .@"-" => 4,
             .@"*", .@"/" => 3,
+            .@".", .@".{", .@".(" => 0,
             else => 255,
         };
     }
@@ -52,6 +68,14 @@ pub const Lexeme = enum(u8) {
             .@"}", .@";", .@",", .@")" => true,
             else => false,
         };
+    }
+
+    pub fn innerOp(self: Lexeme) ?Lexeme {
+        const byte: u8 = @intFromEnum(self);
+        switch (byte -| 128) {
+            '+', '-' => return @enumFromInt(byte - 128),
+            else => return null,
+        }
     }
 };
 
@@ -76,6 +100,10 @@ pub fn init(source: []const u8, cursor: u32) Lexer {
 pub fn peek(source: []const u8, cursor: u32) Token {
     var lexer = init(source, cursor);
     return lexer.next();
+}
+
+pub fn peekStr(source: []const u8, cursor: u32) []const u8 {
+    return peek(source, cursor).view(source);
 }
 
 pub fn next(self: *Lexer) Token {
@@ -119,7 +147,13 @@ pub fn next(self: *Lexer) Token {
                 while (self.advance()) |ch| if (ch == '\n') break;
                 break :l .Comment;
             } else @enumFromInt(c),
-            ':', '<' => |c| @enumFromInt(if (self.advanceIf('=')) c + 128 else c),
+            '.' => if (self.advanceIf('{'))
+                .@".{"
+            else if (self.advanceIf('('))
+                .@".("
+            else
+                .@".",
+            ':', '<', '+', '-', '=', '!' => |c| @enumFromInt(if (self.advanceIf('=')) c + 128 else c),
             else => |c| @enumFromInt(c),
         };
         return Token.init(pos, self.cursor, kind);

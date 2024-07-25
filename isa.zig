@@ -93,7 +93,8 @@ pub fn packMany(comptime instrs: anytype) []const u8 {
     return &outa;
 }
 
-pub fn disasmOne(code: []const u8, cursor: usize, labelMap: *const std.AutoHashMap(u32, u32), out: *std.ArrayList(u8)) !usize {
+pub fn disasmOne(full_code: []const u8, cursor: usize, labelMap: *const std.AutoHashMap(u32, u32), out: *std.ArrayList(u8), write_offset: bool) !usize {
+    if (write_offset) try out.writer().print("{d:4} ", .{cursor});
     const padding = if (labelMap.count() != 0)
         2 + @max(std.math.log2_int_ceil(usize, labelMap.count()) / 4, 1)
     else
@@ -104,12 +105,14 @@ pub fn disasmOne(code: []const u8, cursor: usize, labelMap: *const std.AutoHashM
         for (0..padding) |_| try out.append(' ');
     }
 
+    const code = full_code[cursor..];
+
     const op: Op = @enumFromInt(code[0]);
     switch (op) {
         inline else => |v| {
             try out.appendSlice(@tagName(v));
-            for (@tagName(v).len..max_instr_len) |_| try out.append(' ');
             const argTys = spec[@intFromEnum(v)].args;
+            if (argTys.len > 0) for (@tagName(v).len..max_instr_len) |_| try out.append(' ');
             comptime var i: usize = 1;
             inline for (argTys) |argTy| {
                 if (i > 1) try out.appendSlice(", ") else try out.appendSlice(" ");
@@ -141,12 +144,12 @@ fn disasmArg(
     }
 }
 
-pub fn disasm(code: []const u8, out: *std.ArrayList(u8)) !void {
+pub fn disasm(code: []const u8, out: *std.ArrayList(u8), write_offset: bool) !void {
     var labelMap = try makeLabelMap(code, out.allocator);
     defer labelMap.deinit();
     var cursor: usize = 0;
     while (code.len > cursor) {
-        cursor += try disasmOne(code[cursor..], cursor, &labelMap, out);
+        cursor += try disasmOne(code, cursor, &labelMap, out, write_offset);
     }
 }
 
@@ -164,7 +167,7 @@ fn makeLabelMap(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(u32, 
                     const arg: *align(1) const ArgType(ty) =
                         @ptrCast(@alignCast(&code[@intCast(cursor)]));
                     const pos: u32 = @intCast(cursor_snap + arg.*);
-                    _ = @as(Op, @enumFromInt(code[pos]));
+                    std.debug.assert(code[pos] < instr_count);
                     if (map.get(pos) == null) try map.put(pos, map.count());
                     cursor += @sizeOf(@TypeOf(arg.*));
                 },
@@ -252,9 +255,9 @@ pub const spec = .{
     ni("ori", bregm, bdesc("|")),
     ni("xori", bregm, bdesc("^")),
 } ++
-    nsimop("slui", "<<") ++
-    nsimop("srui", ">>") ++
-    nsimop("srsi", ">> (signed)") ++ .{
+    nsi("slui", .{ .reg, .reg, .imm8 }, false, bdescm("<<")) ++
+    nsi("srui", .{ .reg, .reg, .imm8 }, false, bdescm(">>")) ++
+    nsi("srsi", .{ .reg, .reg, .imm8 }, false, bdescm(">> (signed)")) ++ .{
     ni("cmpui", bregm, "unsigned coimparison" ++ cmp_mapping),
     ni("cmpsi", bregm, "signed coimparison" ++ cmp_mapping),
     ni("cp", .{ .reg, .reg }, "$0 = $1"),
@@ -267,7 +270,7 @@ pub const spec = .{
     ni("ldr", .{ .reg, .reg, .rel32, .imm16 }, "$0[#3] = (pc + $1 + #2)[#3]"),
     ni("str", .{ .reg, .reg, .rel32, .imm16 }, "(pc + $1 + #2)[#3] = $0[#3]"),
     ni("bmc", .{ .reg, .reg, .imm16 }, "$0[#2] = $1[#2]"),
-    ni("brm", .{ .reg, .reg, .imm16 }, "$0 = $1[#2]"),
+    ni("brc", .{ .reg, .reg, .imm16 }, "$0 = $1[#2]"),
     ni("jmp", .{.rel32}, "pc += #1"),
     ni("jal", .{ .reg, .reg, .rel32 }, "pc += #1"),
     ni("jala", .{ .reg, .reg, .abs64 }, "pc += #1"),

@@ -4,9 +4,47 @@ test {
     _ = @import("codegen.zig");
 }
 
+const debug = @import("builtin").mode == .Debug;
+
+pub fn dbg(value: anytype) @TypeOf(value) {
+    std.debug.print("{any}\n", .{value});
+    return value;
+}
+
+pub const StaticTrace = struct {
+    index: if (debug) usize else void,
+    frames: if (debug) [frame_limit]usize else void,
+
+    const frame_limit = 10;
+
+    pub fn init(return_addr: usize) StaticTrace {
+        if (!debug) return undefined;
+        var trace: StaticTrace = undefined;
+        var stack_trace = std.builtin.StackTrace{
+            .index = undefined,
+            .instruction_addresses = &trace.frames,
+        };
+        std.debug.captureStackTrace(return_addr, &stack_trace);
+        trace.index = stack_trace.index;
+        return trace;
+    }
+
+    pub fn dump(self: *StaticTrace) void {
+        if (!debug) return;
+        std.debug.dumpStackTrace(.{
+            .index = self.index,
+            .instruction_addresses = &self.frames,
+        });
+    }
+};
+
 pub fn isErr(value: anytype) bool {
     value catch return true;
     return false;
+}
+
+pub inline fn alignTo(offset: anytype, alignment: @TypeOf(offset)) @TypeOf(offset) {
+    return (offset + alignment - 1) & ~(alignment - 1);
 }
 
 pub fn findReadmeSnippet(comptime name: []const u8) ![]const u8 {
