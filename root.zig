@@ -25,16 +25,14 @@ pub fn EnumId(comptime Tag: type) type {
 
 pub fn EnumSlice(comptime T: type) type {
     return struct {
-        comptime {
-            _ = T;
-        }
+        const Elem = T;
 
         start: u32,
         end: u32,
     };
 }
 
-pub fn EnumStore(comptime SelfId: type, comptime SelfSlice: type, comptime T: type) type {
+pub fn EnumStore(comptime SelfId: type, comptime T: type) type {
     return struct {
         const Self = @This();
         const payload_align = b: {
@@ -69,13 +67,13 @@ pub fn EnumStore(comptime SelfId: type, comptime SelfSlice: type, comptime T: ty
 
         pub fn allocSlice(
             self: *Self,
+            comptime E: type,
             gpa: std.mem.Allocator,
-            slice: []const SelfId,
-        ) !SelfSlice {
-            const Ider = SelfId;
-            std.mem.copyForwards(Ider, try self.allocLow(gpa, Ider, slice.len), slice);
-            return SelfSlice{
-                .start = @intCast(self.store.items.len - @sizeOf(Ider) * slice.len),
+            slice: []const E,
+        ) !EnumSlice(E) {
+            std.mem.copyForwards(E, try self.allocLow(gpa, E, slice.len), slice);
+            return .{
+                .start = @intCast(self.store.items.len - @sizeOf(E) * slice.len),
                 .end = @intCast(self.store.items.len),
             };
         }
@@ -121,10 +119,10 @@ pub fn EnumStore(comptime SelfId: type, comptime SelfSlice: type, comptime T: ty
             return loc;
         }
 
-        pub fn view(self: *const Self, slice: SelfSlice) []SelfId {
+        pub fn view(self: *const Self, slice: anytype) []@TypeOf(slice).Elem {
             const slc = self.store.items[slice.start..slice.end];
-            const len = slc.len / @sizeOf(SelfId);
-            const ptr: [*]SelfId = @ptrCast(@alignCast(slc.ptr));
+            const len = slc.len / @sizeOf(@TypeOf(slice).Elem);
+            const ptr: [*]@TypeOf(slice).Elem = @ptrCast(@alignCast(slc.ptr));
             return ptr[0..len];
         }
 

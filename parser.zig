@@ -8,9 +8,9 @@ const std = @import("std");
 const root = @import("root.zig");
 const Lexer = @import("lexer.zig");
 const Ast = @This();
-const Store = root.EnumStore(Id, Slice, Expr);
+const Store = root.EnumStore(Id, Expr);
 pub const Id = root.EnumId(Kind);
-pub const Slice = root.EnumSlice(Kind);
+pub const Slice = root.EnumSlice(Id);
 
 pub const Ident = packed struct(Ident.Repr) {
     const Repr = u32;
@@ -206,7 +206,7 @@ const Parser = struct {
         }
         std.debug.assert(remining == 0);
 
-        return self.store.allocSlice(self.gpa, itemBuf.items);
+        return self.store.allocSlice(Id, self.gpa, itemBuf.items);
     }
 
     fn parseExpr(self: *Parser) Error!Id {
@@ -338,7 +338,7 @@ const Parser = struct {
                         _ = self.tryAdvance(.@";");
                     }
                     self.finalizeVariables(scope_frame);
-                    break :b try self.store.allocSlice(self.gpa, buf.items);
+                    break :b try self.store.allocSlice(Id, self.gpa, buf.items);
                 },
             } },
             .@"(" => {
@@ -466,7 +466,7 @@ const Parser = struct {
             if (sep) |s| _ = try self.expectAdvance(s);
             self.list_pos.indented = true;
         }
-        return try self.store.allocSlice(self.gpa, buf.items);
+        return try self.store.allocSlice(Id, self.gpa, buf.items);
     }
 
     fn parseArg(self: *Parser) Error!Id {
