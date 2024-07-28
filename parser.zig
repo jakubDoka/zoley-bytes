@@ -8,10 +8,9 @@ const std = @import("std");
 const root = @import("root.zig");
 const Lexer = @import("lexer.zig");
 const Ast = @This();
-const IdRepr = u32;
-const Store = EnumStore(Id, Slice, Expr);
-pub const Id = EnumId(Kind);
-pub const Slice = EnumSlice(Kind);
+const Store = root.EnumStore(Id, Slice, Expr);
+pub const Id = root.EnumId(Kind);
+pub const Slice = root.EnumSlice(Kind);
 
 pub const Ident = packed struct(Ident.Repr) {
     const Repr = u32;
@@ -26,6 +25,10 @@ pub const Ident = packed struct(Ident.Repr) {
 
 pub fn cmp(pos: u32, source: []const u8, repr: []const u8) bool {
     return std.mem.eql(u8, Lexer.peekStr(source, pos), repr);
+}
+
+pub fn Payload(comptime kind: Kind) type {
+    return std.meta.TagPayload(Expr, kind);
 }
 
 pub const Kind = enum {
@@ -56,8 +59,8 @@ pub const Expr = union(Kind) {
     Void,
     Comment: Pos,
     Ident: struct {
-        pos: Pos,
-        id: Ident,
+        pos: Pos = Pos.init(0),
+        id: Ident = Ident.init(Lexer.Token.init(0, 0, .Eof)),
     },
     Buty: struct {
         pos: Pos,
@@ -743,16 +746,23 @@ pub fn init(path: []const u8, code: []const u8, gpa: std.mem.Allocator) !Ast {
     };
 }
 
-pub fn posOf(self: *const Ast, id: Id) Pos {
-    return switch (self.exprs.get(id)) {
-        inline else => |v| switch (@TypeOf(v)) {
-            void => Pos.init(0),
-            Pos => v,
-            else => |Vt| if (@hasField(Vt, "pos"))
-                v.pos
-            else
-                self.posOf(@field(v, std.meta.fields(Vt)[0].name)),
+pub fn posOf(self: *const Ast, origin: anytype) Pos {
+    return switch (@TypeOf(origin)) {
+        Id => switch (self.exprs.get(origin)) {
+            inline else => |v| self.posOfPayload(v),
         },
+        else => self.posOfPayload(origin),
+    };
+}
+
+fn posOfPayload(self: *const Ast, v: anytype) Pos {
+    return switch (@TypeOf(v)) {
+        void => Pos.init(0),
+        Pos => v,
+        else => |Vt| if (@hasField(Vt, "pos"))
+            v.pos
+        else
+            self.posOf(@field(v, std.meta.fields(Vt)[0].name)),
     };
 }
 
@@ -778,130 +788,4 @@ pub fn lineCol(self: *const Ast, index: isize) struct { usize, usize } {
         last_nline = @intCast(i);
     };
     return .{ line + 1, @intCast(index - last_nline) };
-}
-
-fn EnumId(comptime Tag: type) type {
-    return packed struct(IdRepr) {
-        taga: std.meta.Tag(Tag),
-        index: std.meta.Int(.unsigned, @bitSizeOf(IdRepr) - @bitSizeOf(Tag)),
-
-        pub fn zeroSized(taga: Tag) @This() {
-            return .{ .taga = @intFromEnum(taga), .index = 0 };
-        }
-
-        pub fn tag(self: @This()) Tag {
-            return @enumFromInt(self.taga);
-        }
-    };
-}
-
-fn EnumSlice(comptime T: type) type {
-    return struct {
-        comptime {
-            _ = T;
-        }
-
-        start: u32,
-        end: u32,
-    };
-}
-
-fn EnumStore(comptime SelfId: type, comptime SelfSlice: type, comptime T: type) type {
-    return struct {
-        const Self = @This();
-        const payload_align = b: {
-            var max_align: u29 = 1;
-            for (std.meta.fields(T)) |field| {
-                max_align = @max(max_align, @alignOf(field.type));
-            }
-            break :b max_align;
-        };
-
-        store: std.ArrayListAlignedUnmanaged(u8, payload_align) = .{},
-
-        pub fn allocDyn(self: *Self, gpa: std.mem.Allocator, value: T) !SelfId {
-            return switch (value) {
-                inline else => |v, t| try self.alloc(gpa, t, v),
-            };
-        }
-
-        pub fn alloc(
-            self: *Self,
-            gpa: std.mem.Allocator,
-            comptime tag: std.meta.Tag(T),
-            value: std.meta.TagPayload(T, tag),
-        ) !SelfId {
-            const Value = @TypeOf(value);
-            (try self.allocLow(gpa, Value, 1))[0] = value;
-            return SelfId{
-                .taga = @intFromEnum(tag),
-                .index = @intCast(self.store.items.len - @sizeOf(Value)),
-            };
-        }
-
-        pub fn allocSlice(
-            self: *Self,
-            gpa: std.mem.Allocator,
-            slice: []const SelfId,
-        ) !SelfSlice {
-            const Ider = SelfId;
-            std.mem.copyForwards(Ider, try self.allocLow(gpa, Ider, slice.len), slice);
-            return SelfSlice{
-                .start = @intCast(self.store.items.len - @sizeOf(Ider) * slice.len),
-                .end = @intCast(self.store.items.len),
-            };
-        }
-
-        fn allocLow(self: *Self, gpa: std.mem.Allocator, comptime E: type, count: usize) ![]E {
-            const alignment: usize = @alignOf(E);
-            const padded_len = root.alignTo(self.store.items.len, alignment);
-            const required_space = padded_len + @sizeOf(E) * count;
-            try self.store.resize(gpa, required_space);
-            const dest: [*]E = @ptrCast(@alignCast(self.store.items.ptr[padded_len..]));
-            return dest[0..count];
-        }
-
-        pub fn get(self: *const Self, id: SelfId) T {
-            switch (@as(std.meta.Tag(T), @enumFromInt(id.taga))) {
-                inline else => |t| {
-                    const Value = std.meta.TagPayload(T, t);
-                    const loc: *Value = @ptrCast(@alignCast(&self.store.items[id.index]));
-                    return @unionInit(T, @tagName(t), loc.*);
-                },
-            }
-        }
-
-        pub fn getTyped(
-            self: *const Self,
-            comptime tag: std.meta.Tag(T),
-            id: SelfId,
-        ) ?std.meta.TagPayload(T, tag) {
-            if (tag != id.tag()) return null;
-            const Value = std.meta.TagPayload(T, tag);
-            const loc: *Value = @ptrCast(@alignCast(&self.store.items[id.index]));
-            return loc.*;
-        }
-
-        pub fn getTypedPtr(
-            self: *Self,
-            comptime tag: std.meta.Tag(T),
-            id: SelfId,
-        ) ?*std.meta.TagPayload(T, tag) {
-            if (tag != id.tag()) return null;
-            const Value = std.meta.TagPayload(T, tag);
-            const loc: *Value = @ptrCast(@alignCast(&self.store.items[id.index]));
-            return loc;
-        }
-
-        pub fn view(self: *const Self, slice: SelfSlice) []SelfId {
-            const slc = self.store.items[slice.start..slice.end];
-            const len = slc.len / @sizeOf(SelfId);
-            const ptr: [*]SelfId = @ptrCast(@alignCast(slc.ptr));
-            return ptr[0..len];
-        }
-
-        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
-            self.store.deinit(gpa);
-        }
-    };
 }

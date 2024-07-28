@@ -131,17 +131,21 @@ main := fn(): int {
     if inst.c != 3 {
         return 0
     }
-    if sum(inst.ty) != 5 {
+    if sum(inst.ty) != 0 {
         return 100
     }
     return pass(&inst.ty)
 }
 
 sum := fn(t: Ty): int {
-    return t.a + t.b
+    t.a -= 2
+    t.b += 1
+    return t.a - t.b
 }
 
 pass := fn(t: ^Ty): int {
+    t.a -= 1
+    t.a += 1
     return t.a - t.b
 }
 
@@ -165,3 +169,9 @@ main := fn(): int {
     return c + e + f - 6
 }
 ```
+
+## Codegen architecture brainstorming
+
+One of the most annoying things I am trying to implement is storing structs in registers. The fact that any register can have offset is not enough, the field it self might even overlap two registers, which makes for incredibly ugly code. Most of this revolves around moving memory that produces huge amount of bit twiddling. But Then again, I need to do this somehow, and I need to emit optimal code as well. Obviously, we can't emit the field stores and loads all the time, since we would bloat the binary and slow down the program. At this point we need optimizations, that would both simplify the code that is emitted as well as compiler code that emits it.
+
+While writing previous chunk of useless text, I came up with, brilliant idea. Lets cache the loaded fields, meaning, We can create a tree of fields that are mapped to registers and stacks by offset.

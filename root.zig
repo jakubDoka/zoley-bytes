@@ -6,6 +6,134 @@ test {
 
 const debug = @import("builtin").mode == .Debug;
 
+const IdRepr = u32;
+
+pub fn EnumId(comptime Tag: type) type {
+    return packed struct(IdRepr) {
+        taga: std.meta.Tag(Tag),
+        index: std.meta.Int(.unsigned, @bitSizeOf(IdRepr) - @bitSizeOf(Tag)),
+
+        pub fn zeroSized(taga: Tag) @This() {
+            return .{ .taga = @intFromEnum(taga), .index = 0 };
+        }
+
+        pub fn tag(self: @This()) Tag {
+            return @enumFromInt(self.taga);
+        }
+    };
+}
+
+pub fn EnumSlice(comptime T: type) type {
+    return struct {
+        comptime {
+            _ = T;
+        }
+
+        start: u32,
+        end: u32,
+    };
+}
+
+pub fn EnumStore(comptime SelfId: type, comptime SelfSlice: type, comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const payload_align = b: {
+            var max_align: u29 = 1;
+            for (std.meta.fields(T)) |field| {
+                max_align = @max(max_align, @alignOf(field.type));
+            }
+            break :b max_align;
+        };
+
+        store: std.ArrayListAlignedUnmanaged(u8, payload_align) = .{},
+
+        pub fn allocDyn(self: *Self, gpa: std.mem.Allocator, value: T) !SelfId {
+            return switch (value) {
+                inline else => |v, t| try self.alloc(gpa, t, v),
+            };
+        }
+
+        pub fn alloc(
+            self: *Self,
+            gpa: std.mem.Allocator,
+            comptime tag: std.meta.Tag(T),
+            value: std.meta.TagPayload(T, tag),
+        ) !SelfId {
+            const Value = @TypeOf(value);
+            (try self.allocLow(gpa, Value, 1))[0] = value;
+            return SelfId{
+                .taga = @intFromEnum(tag),
+                .index = @intCast(self.store.items.len - @sizeOf(Value)),
+            };
+        }
+
+        pub fn allocSlice(
+            self: *Self,
+            gpa: std.mem.Allocator,
+            slice: []const SelfId,
+        ) !SelfSlice {
+            const Ider = SelfId;
+            std.mem.copyForwards(Ider, try self.allocLow(gpa, Ider, slice.len), slice);
+            return SelfSlice{
+                .start = @intCast(self.store.items.len - @sizeOf(Ider) * slice.len),
+                .end = @intCast(self.store.items.len),
+            };
+        }
+
+        fn allocLow(self: *Self, gpa: std.mem.Allocator, comptime E: type, count: usize) ![]E {
+            const alignment: usize = @alignOf(E);
+            const padded_len = alignTo(self.store.items.len, alignment);
+            const required_space = padded_len + @sizeOf(E) * count;
+            try self.store.resize(gpa, required_space);
+            const dest: [*]E = @ptrCast(@alignCast(self.store.items.ptr[padded_len..]));
+            return dest[0..count];
+        }
+
+        pub fn get(self: *const Self, id: SelfId) T {
+            switch (@as(std.meta.Tag(T), @enumFromInt(id.taga))) {
+                inline else => |t| {
+                    const Value = std.meta.TagPayload(T, t);
+                    const loc: *Value = @ptrCast(@alignCast(&self.store.items[id.index]));
+                    return @unionInit(T, @tagName(t), loc.*);
+                },
+            }
+        }
+
+        pub fn getTyped(
+            self: *const Self,
+            comptime tag: std.meta.Tag(T),
+            id: SelfId,
+        ) ?std.meta.TagPayload(T, tag) {
+            if (tag != id.tag()) return null;
+            const Value = std.meta.TagPayload(T, tag);
+            const loc: *Value = @ptrCast(@alignCast(&self.store.items[id.index]));
+            return loc.*;
+        }
+
+        pub fn getTypedPtr(
+            self: *Self,
+            comptime tag: std.meta.Tag(T),
+            id: SelfId,
+        ) ?*std.meta.TagPayload(T, tag) {
+            if (tag != id.tag()) return null;
+            const Value = std.meta.TagPayload(T, tag);
+            const loc: *Value = @ptrCast(@alignCast(&self.store.items[id.index]));
+            return loc;
+        }
+
+        pub fn view(self: *const Self, slice: SelfSlice) []SelfId {
+            const slc = self.store.items[slice.start..slice.end];
+            const len = slc.len / @sizeOf(SelfId);
+            const ptr: [*]SelfId = @ptrCast(@alignCast(slc.ptr));
+            return ptr[0..len];
+        }
+
+        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            self.store.deinit(gpa);
+        }
+    };
+}
+
 pub fn dbg(value: anytype) @TypeOf(value) {
     std.debug.print("{any}\n", .{value});
     return value;

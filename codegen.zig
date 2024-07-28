@@ -24,6 +24,7 @@ ret_relocs: std.ArrayListUnmanaged(i16) = .{},
 stack_relocs: std.ArrayListUnmanaged(i16) = .{},
 loops: std.ArrayListUnmanaged(Loop) = .{},
 loop_relocs: std.ArrayListUnmanaged(i16) = .{},
+errors: std.ArrayListUnmanaged(u8) = .{},
 
 const std = @import("std");
 const root = @import("root.zig");
@@ -257,12 +258,10 @@ const Loc = struct {
     }
 
     fn psi(self: Loc, offset: Offset) i64 {
-        _ = root.dbg(self);
         return @bitCast(PackedStack{ .id = self.stack, .offset = self.offset + offset });
     }
 
     fn psu(self: Loc, offset: Offset) u64 {
-        _ = root.dbg(self);
         return @bitCast(PackedStack{ .id = self.stack, .offset = self.offset + offset });
     }
 };
@@ -429,7 +428,7 @@ fn generateFunc(self: *Codegen, comptime entry: bool, id: usize) !void {
         const arg_decl = ast.exprs.getTyped(.Arg, arg_decl_id).?;
         const msg = "Compiled does not (yes) support patterns here";
         const bindings = ast.exprs.getTyped(.Ident, arg_decl.bindings) orelse
-            self.report(func.file, ast.posOf(arg_decl.bindings), msg, .{});
+            try self.report(Ast.Payload(.Ident){}, func.file, arg_decl.bindings, msg, .{});
         const loc = switch (self.sizeOf(arg_ty)) {
             0 => Loc{},
             1...8 => b: {
@@ -440,8 +439,8 @@ fn generateFunc(self: *Codegen, comptime entry: bool, id: usize) !void {
             },
             9...16 => b: {
                 const loc = Loc{
-                    .reg = root.dbg(self.cx.regs.alloc()),
-                    .sec_reg = root.dbg(self.cx.regs.alloc()),
+                    .reg = self.cx.regs.alloc(),
+                    .sec_reg = self.cx.regs.alloc(),
                 };
                 try self.emit(.brc, .{ loc.reg, arg_reg, 2 });
                 arg_reg += 2;
@@ -458,8 +457,9 @@ fn generateFunc(self: *Codegen, comptime entry: bool, id: usize) !void {
             .value = .{ .ty = arg_ty, .loc = loc },
         });
     }
+
     if (try catchUnreachable(self.generateExpr(func.file, .{}, decl.body)) != null) {
-        self.report(func.file, ast.posOf(decl.body), "fuction does not return", .{});
+        try self.report({}, func.file, decl.body, "fuction does not return", .{});
     }
 
     func = &self.tys.funcs.items[id];
@@ -547,17 +547,19 @@ fn generateExpr(self: *Codegen, file: File, ctx: Ctx, id: Ast.Id) Error!Value {
             else
                 null;
             const ty = explicit_ty orelse ctx.ty orelse
-                self.report(file, c.pos, "Cant infer type of the struct", .{});
-            if (ty.tag() != .@"struct")
-                self.report(file, c.pos, "Can only construct structs", .{});
+                try self.report(buty(.void), file, c.pos, "Cant infer type of the struct", .{});
+            if (ty.tag() != .@"struct") {
+                try self.report({}, file, c.pos, "Can only construct structs", .{});
+                return .{};
+            }
             const ctor_fields = ast.exprs.view(c.fields);
             const dst = ctx.loc orelse try self.allocStack(ty);
 
             for (ctor_fields) |field_id| {
                 const ctor_field_ast = ast.exprs.getTyped(.CtorField, field_id).?;
                 const fty, const offset =
-                    self.fieldOffset(file, ctor_field_ast.pos, ty.index, ctor_field_ast.pos);
-                var field_dst = dst.offseted(root.dbg(offset));
+                    try self.fieldOffset(file, ctor_field_ast.pos, ty.index, ctor_field_ast.pos);
+                var field_dst = dst.offseted(offset);
                 field_dst.flags.is_borrowed = true;
                 const fctx = .{ .ty = fty, .loc = field_dst };
                 _ = try self.generateExpr(file, fctx, ctor_field_ast.value);
@@ -638,13 +640,19 @@ fn generateExpr(self: *Codegen, file: File, ctx: Ctx, id: Ast.Id) Error!Value {
             return .{};
         },
         .Break => |b| {
-            if (self.loops.items.len == 0) self.report(file, b, "break outside of loop", .{});
+            if (self.loops.items.len == 0) {
+                try self.report({}, file, b, "break outside of loop", .{});
+                return .{};
+            }
             try self.loop_relocs.append(self.gpa, self.localOffset());
             try self.emit(.jmp, .{0});
             return error.LoopControl;
         },
         .Continue => |c| {
-            if (self.loops.items.len == 0) self.report(file, c, "continue outside of loop", .{});
+            if (self.loops.items.len == 0) {
+                try self.report({}, file, c, "continue outside of loop", .{});
+                return .{};
+            }
             const loop = self.loops.items[self.loops.items.len - 1];
             try self.emit(.jmp, .{loop.back_jump_offset - self.localOffset()});
             return error.LoopControl;
@@ -668,7 +676,7 @@ fn generateExpr(self: *Codegen, file: File, ctx: Ctx, id: Ast.Id) Error!Value {
         .Call => |call| {
             const todo = "TODO: handle the complex function expression";
             const called = ast.exprs.getTyped(.Ident, call.called) orelse
-                self.report(file, call.called, todo, .{});
+                try self.report(Ast.Payload(.Ident){}, file, call.called, todo, .{});
             const func_id = try self.findOrDeclare(called.pos, file, called.id);
             std.debug.assert(func_id.tag() == .func);
             const func = self.tys.funcs.items[func_id.index];
@@ -742,10 +750,10 @@ fn generateExpr(self: *Codegen, file: File, ctx: Ctx, id: Ast.Id) Error!Value {
                     else
                         unreachable;
 
-                    return self.assignToCtx(
-                        ctx,
-                        .{ .ty = func.ret, .loc = final_ret },
-                    );
+                    return self.assignToCtx(file, call, ctx, .{
+                        .ty = func.ret,
+                        .loc = final_ret,
+                    });
                 },
                 9...16 => unreachable,
                 else => if (ctx.loc) |l| {
@@ -776,34 +784,26 @@ fn generateExpr(self: *Codegen, file: File, ctx: Ctx, id: Ast.Id) Error!Value {
         .Ident => |i| {
             const variable = &self.variables.items[i.id.index];
 
-            if (ctx.loc) |loc| {
-                try self.assign(loc, variable.value);
-                return .{ .ty = variable.value.ty, .loc = loc };
-            }
-
             if (i.id.last and
                 (self.loops.items.len == 0 or self.loops.getLast().var_base <= i.id.index))
             {
                 defer variable.value = .{};
-                if (ctx.loc) |loc| {
-                    try self.assign(loc, variable.value);
-                    self.freeValue(variable.value);
-                    return .{ .ty = variable.value.ty, .loc = loc };
-                }
-                return variable.value;
+                return self.assignToCtx(file, i, ctx, variable.value);
             }
 
-            return variable.value.toggled("borrowed", true);
+            return try self.assignToCtx(file, i, ctx, variable.value.toggled("borrowed", true));
         },
         .Integer => |i| {
             const int_token = Lexer.peek(ast.source, i.index);
-            const int_value = std.fmt.parseInt(u64, int_token.view(ast.source), 10) catch |e| {
-                self.report(file, i, "Could not parse integer: {any}", .{e});
-            };
+            const int_value = std.fmt.parseInt(u64, int_token.view(ast.source), 10) catch |e|
+                try self.report(@as(u64, 0), file, i, "Could not parse integer: {any}", .{e});
             if (ctx.loc) |loc| if (loc.flags.is_derefed) {
                 const src = Loc{ .reg = self.cx.regs.alloc() };
                 try self.emit(.li64, .{ src.reg, int_value });
-                return self.assignToCtx(ctx, .{ .ty = ctx.ty orelse buty(.int), .loc = src });
+                return self.assignToCtx(file, i, ctx, .{
+                    .ty = ctx.ty orelse buty(.int),
+                    .loc = src,
+                });
             } else {
                 try self.emit(.li64, .{ loc.reg, int_value });
                 return .{ .ty = ctx.ty orelse buty(.int), .loc = loc };
@@ -829,19 +829,28 @@ fn generateExpr(self: *Codegen, file: File, ctx: Ctx, id: Ast.Id) Error!Value {
                 base.loc = base.loc.toggled("derefed", true);
             }
 
-            if (base.ty.tag() != .@"struct")
-                self.report(file, f.field, "Cant acces fields on this", .{}); // TODO: log type
+            if (base.ty.tag() != .@"struct") {
+                try self.report({}, file, f.field, "Cant acces fields on this", .{});
+                // TODO: log type
+                return .{};
+            }
 
             const ty, const offset =
-                self.fieldOffset(file, f.field, base.ty.index, f.field);
+                try self.fieldOffset(file, f.field, base.ty.index, f.field);
             const value = Value{ .ty = ty, .loc = base.loc.offseted(offset) };
-            return try self.assignToCtx(ctx, value);
+            return try self.assignToCtx(file, f, ctx, value);
         },
         else => |v| std.debug.panic("unhandled expr: {any}", .{v}),
     }
 }
 
-fn fieldOffset(self: *Codegen, file: File, pos: anytype, stru_id: usize, field: anytype) struct { Ty, Offset } {
+fn fieldOffset(
+    self: *Codegen,
+    file: File,
+    pos: anytype,
+    stru_id: usize,
+    field: anytype,
+) !struct { Ty, Offset } {
     const stru = self.tys.structs.items[stru_id];
     const ast = self.files[stru.file];
     const ctrot_field_name = switch (@TypeOf(field)) {
@@ -850,6 +859,7 @@ fn fieldOffset(self: *Codegen, file: File, pos: anytype, stru_id: usize, field: 
     };
     var offset: Offset = 0;
     const msg = "struct does not have {s} field";
+    const dummy = .{ buty(.void), @as(Offset, 0) };
     return for (
         ast.exprs.view(stru.field_names),
         stru.field_types.view(self.tys.allocated.items),
@@ -862,7 +872,7 @@ fn fieldOffset(self: *Codegen, file: File, pos: anytype, stru_id: usize, field: 
             Lexer.peekStr(ast.source, field_ast.pos.index),
         )) break .{ field_ty, offset };
         offset += self.sizeOf(field_ty);
-    } else self.report(file, pos, msg, .{ctrot_field_name});
+    } else try self.report(dummy, file, pos, msg, .{ctrot_field_name});
 }
 
 fn generateUnOp(self: *Codegen, file: File, ctx: Ctx, payload: std.meta.TagPayload(Ast.Expr, .UnOp)) !Value {
@@ -871,24 +881,26 @@ fn generateUnOp(self: *Codegen, file: File, ctx: Ctx, payload: std.meta.TagPaylo
             const ty = if (ctx.ty) |ty| self.derefTy(ty) else null;
             var oper = try self.generateExpr(file, .{ .ty = ty }, payload.oper);
             oper.ty = ctx.ty orelse try self.makePtr(oper.ty);
-            if (!oper.loc.flags.is_derefed)
-                self.report(file, payload.oper, "cannot take address of a value", .{});
-            return try self.assignToCtx(ctx, oper.toggled("derefed", false));
+            if (!oper.loc.flags.is_derefed) {
+                try self.report({}, file, payload.oper, "cannot take address of a value", .{});
+                return .{};
+            }
+            return try self.assignToCtx(file, payload, ctx, oper.toggled("derefed", false));
         },
         .@"*" => {
             const ty = if (ctx.ty) |ty| try self.makePtr(ty) else null;
             var oper = try self.generateExpr(file, .{ .ty = ty }, payload.oper);
             try self.ensureLoaded(&oper);
             oper.ty = ctx.ty orelse self.derefTy(oper.ty).?;
-            return try self.assignToCtx(ctx, oper.toggled("derefed", true));
+            return try self.assignToCtx(file, payload, ctx, oper.toggled("derefed", true));
         },
         else => |v| std.debug.panic("undandeld unop: {any}", .{v}),
     }
 }
 
-fn assignToCtx(self: *Codegen, ctx: Ctx, src: Value) !Value {
+fn assignToCtx(self: *Codegen, file: File, pos: anytype, ctx: Ctx, src: Value) !Value {
     const dst = ctx.loc orelse return src;
-    try self.assign(dst, src);
+    try self.assign(file, pos, .{ .ty = ctx.ty orelse src.ty, .loc = dst }, src);
     self.freeValue(src);
     return .{ .ty = src.ty, .loc = dst };
 }
@@ -898,7 +910,12 @@ fn fieldMask(size: Size, offset: Offset) u64 {
 }
 
 // TODO: change signature to take a size/type instead
-fn assign(self: *Codegen, pdst: Loc, psrc: Value) !void {
+fn assign(self: *Codegen, file: File, origin: anytype, pdst: Value, psrc: Value) !void {
+    if (!try self.assertMoveTypes(file, origin, pdst.ty, psrc.ty)) return;
+    try self.assignUnchecked(pdst.loc, psrc);
+}
+
+fn assignUnchecked(self: *Codegen, pdst: Loc, psrc: Value) !void {
     var dst, var src, const size = .{ pdst, psrc.loc, self.sizeOf(psrc.ty) };
     if (size == 0) return;
 
@@ -907,6 +924,34 @@ fn assign(self: *Codegen, pdst: Loc, psrc: Value) !void {
         std.debug.assert(src.offset + size <= 8 or src.sec_reg != 0);
         std.debug.assert(dst.offset + size <= 16);
         std.debug.assert(dst.offset + size <= 8 or dst.sec_reg != 0);
+
+        if (size == 8) b: {
+            const src_reg = if (src.offset == 0)
+                src.reg
+            else if (src.offset == 8)
+                src.sec_reg
+            else
+                break :b;
+
+            const dst_reg = if (dst.offset == 0)
+                dst.reg
+            else if (dst.offset == 8)
+                dst.sec_reg
+            else
+                break :b;
+
+            return try self.emit(.cp, .{ dst_reg, src_reg });
+        }
+
+        if (size == 16) {
+            if (src.hasConsecutiveRegs() and dst.hasConsecutiveRegs()) {
+                return try self.emit(.brc, .{ dst.reg, src.reg, 2 });
+            }
+
+            try self.emit(.cp, .{ dst.reg, src.reg });
+            try self.emit(.cp, .{ dst.sec_reg, src.sec_reg });
+            return;
+        }
 
         if (src.offset == 0 and size == 8) {
             return try self.emit(.cp, .{ dst.reg, src.reg });
@@ -1025,6 +1070,63 @@ fn assign(self: *Codegen, pdst: Loc, psrc: Value) !void {
     }
 }
 
+fn assertMoveTypes(self: *Codegen, file: File, pos: anytype, dst: Ty, src: Ty) !bool {
+    const msg = "types dont match, expected {any}, got {any}";
+    if (dst.tag() != src.tag())
+        return try self.report(false, file, pos, msg, .{
+            TD.init(self, dst),
+            TD.init(self, src),
+        });
+
+    return true;
+}
+
+const TD = struct {
+    codegen: *Codegen,
+    ty: Ty,
+
+    fn init(codegen: *Codegen, ty: Ty) @This() {
+        return .{ .codegen = codegen, .ty = ty };
+    }
+
+    pub fn format(
+        slf: @This(),
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        try slf.codegen.fmtTy(slf.ty, writer);
+    }
+};
+
+fn fmtTy(self: *Codegen, ty: Ty, writer: anytype) !void {
+    switch (ty.tag()) {
+        .func => unreachable,
+        .builtin => {
+            const tok: Lexer.Lexeme = @enumFromInt(ty.index);
+            try writer.writeAll(tok.repr());
+        },
+        .pointer => {
+            try writer.writeAll("^");
+            try self.fmtTy(self.tys.allocated.items[ty.index], writer);
+        },
+        .@"struct" => {
+            const stru = self.tys.structs.items[ty.index];
+            const ast = self.files[stru.file];
+            try writer.writeAll("struct {");
+            for (
+                ast.exprs.view(stru.field_names),
+                stru.field_types.view(self.tys.allocated.items),
+            ) |ast_field, ty_field| {
+                const field = ast.exprs.getTyped(.CtorField, ast_field).?;
+                try writer.writeAll(Lexer.peekStr(ast.source, field.pos.index));
+                try writer.writeAll(": ");
+                try self.fmtTy(ty_field, writer);
+            }
+        },
+    }
+}
+
 fn derefTy(self: *Codegen, ty: Ty) ?Ty {
     if (ty.tag() != .pointer) return null;
     return self.tys.allocated.items[ty.index];
@@ -1034,7 +1136,7 @@ fn generateBinOp(
     self: *Codegen,
     file: File,
     ctx: Ctx,
-    payload: std.meta.TagPayload(Ast.Expr, .BinOp),
+    payload: Ast.Payload(.BinOp),
     comptime fold: bool,
 ) !Value {
     const ast = self.files[file];
@@ -1048,7 +1150,7 @@ fn generateBinOp(
         .@":=" => {
             const msg = "destructuring is not (yet) allowed";
             const lhs = ast.exprs.getTyped(.Ident, payload.lhs) orelse
-                self.report(file, payload.lhs, msg, .{});
+                try self.report(Ast.Payload(.Ident){}, file, payload.lhs, msg, .{});
             var rhs = try self.generateExpr(file, .{}, payload.rhs);
             try self.ensureOwned(&rhs);
             if (lhs.id.referenced) {
@@ -1076,13 +1178,13 @@ fn generateBinOp(
                 var rhs = try self.generateExpr(file, .{ .ty = lhs.ty }, payload.rhs);
                 try self.ensureLoaded(&rhs);
                 defer self.freeValue(rhs);
-                if (lhs.loc.flags.is_derefed) {
+                if (lhs.loc.flags.is_derefed or lhs.loc.offset != 0 or self.sizeOf(lhs.ty) < 8) {
                     var loaded = lhs;
                     loaded.loc.flags.is_borrowed = true;
                     try self.ensureOwned(&loaded);
                     defer self.freeValue(loaded);
                     try self.emit(instr, .{ loaded.loc.reg, loaded.loc.reg, rhs.loc.reg });
-                    try self.assign(lhs.loc, .{ .ty = lhs.ty, .loc = loaded.loc });
+                    try self.assignUnchecked(lhs.loc, loaded);
                 } else {
                     try self.emit(instr, .{ lhs.loc.reg, lhs.loc.reg, rhs.loc.reg });
                 }
@@ -1168,7 +1270,7 @@ fn ensureLoaded(self: *Codegen, value: *Value) !void {
         return;
     }
     const loc = Loc{ .reg = self.cx.regs.alloc() };
-    try self.assign(loc, value.*);
+    try self.assignUnchecked(loc, value.*);
     self.freeValue(value.*);
     value.loc = loc;
 }
@@ -1177,7 +1279,7 @@ fn ensureOwned(self: *Codegen, value: *Value) !void {
     if (!value.loc.flags.is_borrowed) return;
     std.debug.assert(self.sizeOf(value.ty) <= 8);
     const loc = Loc{ .reg = self.cx.regs.alloc() };
-    try self.assign(loc, value.*);
+    try self.assignUnchecked(loc, value.*);
     value.loc = loc;
 }
 
@@ -1282,6 +1384,7 @@ fn snapshot(self: *Codegen) Snapshot {
 fn findOrDeclare(self: *Codegen, pos: Ast.Pos, file: File, query: anytype) Error!Ty {
     const ast = self.files[file];
 
+    const msg = "Could not find declaration for {s}";
     const decl, const ident = if (@TypeOf(query) == Ast.Ident) b: {
         const decl = ast.decls[query.index];
         const expr = ast.exprs.getTyped(.BinOp, decl.expr).?;
@@ -1298,7 +1401,7 @@ fn findOrDeclare(self: *Codegen, pos: Ast.Pos, file: File, query: anytype) Error
         }) continue;
 
         break .{ expr.rhs, name.id };
-    } else self.report(file, pos, "Could not find declaration for {s}", .{
+    } else return try self.report(buty(.void), file, pos, msg, .{
         switch (@TypeOf(query)) {
             Ast.Ident => Lexer.peekStr(ast.source, pos.index),
             else => query,
@@ -1380,14 +1483,14 @@ fn makePtr(self: *Codegen, ty: Ty) !Ty {
     return Ty.init(.pointer, self.tys.allocated.items.len - 1);
 }
 
-fn report(self: *Codegen, file: u32, origin: anytype, comptime fmt: []const u8, args: anytype) noreturn {
-    const pos = switch (@TypeOf(origin)) {
-        Ast.Pos => origin,
-        Ast.Id => self.files[file].posOf(origin),
-        else => @compileError("TODO: handle " ++ @typeName(@TypeOf(origin))),
-    };
+fn report(self: *Codegen, ph: anytype, file: u32, origin: anytype, comptime fmt: []const u8, args: anytype) !@TypeOf(ph) {
+    const pos = self.files[file].posOf(origin);
     const line, const col = self.files[file].lineCol(pos.index);
-    std.debug.panic("{s}:{d}:{d}: " ++ fmt, .{ self.files[file].path, line, col } ++ args);
+    try self.errors.writer(self.gpa).print(
+        "{s}:{d}:{d}: " ++ fmt,
+        .{ self.files[file].path, line, col } ++ args,
+    );
+    return ph;
 }
 
 fn testSnippet(comptime name: []const u8) !void {
@@ -1414,20 +1517,29 @@ fn testCodegen(comptime name: []const u8, code: []const u8) !void {
     var output = std.ArrayList(u8).init(gpa);
     defer output.deinit();
 
-    try output.writer().print("\nDISASM\n", .{});
-    try isa.disasm(codegen.output.code.items, &output, false);
+    const not_terminated, const exec_log = if (codegen.errors.items.len != 0) b: {
+        try output.appendSlice("\nERRORS\n");
+        try output.appendSlice(codegen.errors.items);
+        break :b .{ {}, std.ArrayList(u8).init(gpa) };
+    } else b: {
+        try output.writer().print("\nDISASM\n", .{});
+        try isa.disasm(codegen.output.code.items, &output, false);
 
-    var exec_log = std.ArrayList(u8).init(gpa);
+        var exec_log = std.ArrayList(u8).init(gpa);
+        errdefer exec_log.deinit();
+        try exec_log.writer().print("EXECUTION\n", .{});
+        codegen.ct.vm.fuel = 10000;
+        codegen.ct.vm.ip = @intFromPtr(codegen.output.code.items.ptr);
+        codegen.ct.vm.log_buffer = &exec_log;
+        var ctx = Vm.UnsafeCtx{};
+        const ntrm = std.testing.expectEqual(.tx, codegen.ct.vm.run(&ctx));
+
+        try output.writer().print("\nREGISTERS\n", .{});
+        try output.writer().print("$1: {d}\n", .{codegen.ct.vm.regs[1]});
+
+        break :b .{ ntrm, exec_log };
+    };
     defer exec_log.deinit();
-    try exec_log.writer().print("EXECUTION\n", .{});
-    codegen.ct.vm.fuel = 10000;
-    codegen.ct.vm.ip = @intFromPtr(codegen.output.code.items.ptr);
-    codegen.ct.vm.log_buffer = &exec_log;
-    var ctx = Vm.UnsafeCtx{};
-    const not_terminated = std.testing.expectEqual(.tx, codegen.ct.vm.run(&ctx));
-
-    try output.writer().print("\nREGISTERS\n", .{});
-    try output.writer().print("$1: {d}\n", .{codegen.ct.vm.regs[1]});
 
     const old, const new = .{ "tests/" ++ name ++ ".temp.old.txt", name ++ ".temp.new.txt" };
 
