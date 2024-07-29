@@ -2,6 +2,7 @@ const std = @import("std");
 
 test {
     _ = @import("codegen.zig");
+    _ = @import("codegen2.zig");
 }
 
 const debug = @import("builtin").mode == .Debug;
@@ -12,6 +13,10 @@ pub fn EnumId(comptime Tag: type) type {
     return packed struct(IdRepr) {
         taga: std.meta.Tag(Tag),
         index: std.meta.Int(.unsigned, @bitSizeOf(IdRepr) - @bitSizeOf(Tag)),
+
+        pub fn compact(taga: Tag, index: usize) @This() {
+            return .{ .taga = @intFromEnum(taga), .index = @intCast(index) };
+        }
 
         pub fn zeroSized(taga: Tag) @This() {
             return .{ .taga = @intFromEnum(taga), .index = 0 };
@@ -91,7 +96,7 @@ pub fn EnumStore(comptime SelfId: type, comptime T: type) type {
             switch (@as(std.meta.Tag(T), @enumFromInt(id.taga))) {
                 inline else => |t| {
                     const Value = std.meta.TagPayload(T, t);
-                    const loc: *Value = @ptrCast(@alignCast(&self.store.items[id.index]));
+                    const loc: *const Value = if (Value != void) @ptrCast(@alignCast(&self.store.items[id.index])) else &{};
                     return @unionInit(T, @tagName(t), loc.*);
                 },
             }

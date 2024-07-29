@@ -33,9 +33,10 @@ const Ast = @import("parser.zig");
 const Vm = @import("vm.zig");
 const Lexer = @import("lexer.zig");
 const Codegen = @This();
-const File = u32;
-const Offset = u32;
-const Size = u32;
+
+pub const File = u32;
+pub const Offset = u32;
+pub const Size = u32;
 
 const vm_stack_size = 1024 * 1024 * 2;
 const root_file = 0;
@@ -45,8 +46,42 @@ const debug = @import("builtin").mode == .Debug;
 
 const Error = error{ Return, LoopControl, TooLongTuple } || std.mem.Allocator.Error;
 
-const Ty = root.TaggedIndex(u32, enum { builtin, func, pointer, @"struct" });
-const Namespace = root.TaggedIndex(u32, enum { file });
+pub const Ty = root.TaggedIndex(u32, enum { builtin, func, pointer, @"struct" });
+pub const Namespace = root.TaggedIndex(u32, enum { file });
+
+pub const Symbol = struct {
+    const Item = u32;
+
+    ns: Namespace,
+    item: Item,
+
+    fn init(ns: Namespace, item: Item) Symbol {
+        return .{ .ns = ns, .item = item };
+    }
+};
+
+pub const Tuple = packed struct(u32) {
+    const Len = u4;
+    const Base = std.meta.Int(.unsigned, @bitSizeOf(u32) - @bitSizeOf(Len));
+
+    len: Len,
+    base: Base,
+
+    pub fn init(base: usize, len: usize) !Tuple {
+        if (base > std.math.maxInt(Base)) return error.TooLongTuple;
+        return .{ .len = @intCast(len), .base = @intCast(base) };
+    }
+
+    pub fn view(self: Tuple, slice: []const Ty) []const Ty {
+        return slice[self.base..][0..self.len];
+    }
+};
+
+pub const Struct = struct {
+    file: File,
+    field_names: Ast.Slice,
+    field_types: Tuple,
+};
 
 const Loop = struct {
     var_base: u16,
@@ -64,23 +99,6 @@ const ItemReloc = struct {
     offset: u32,
 };
 
-const Tuple = packed struct(u32) {
-    const Len = u4;
-    const Base = std.meta.Int(.unsigned, @bitSizeOf(u32) - @bitSizeOf(Len));
-
-    len: Len,
-    base: Base,
-
-    pub fn init(base: usize, len: usize) !Tuple {
-        if (base > std.math.maxInt(Base)) return error.TooLongTuple;
-        return .{ .len = @intCast(len), .base = @intCast(base) };
-    }
-
-    pub fn view(self: Tuple, slice: []const Ty) []const Ty {
-        return slice[self.base..][0..self.len];
-    }
-};
-
 const Func = struct {
     file: File,
     decl: Ast.Id,
@@ -90,24 +108,7 @@ const Func = struct {
     size: u32 = std.math.maxInt(u32),
 };
 
-const Struct = struct {
-    file: File,
-    field_names: Ast.Slice,
-    field_types: Tuple,
-};
-
-const Symbol = struct {
-    const Item = u32;
-
-    ns: Namespace,
-    item: Item,
-
-    fn init(ns: Namespace, item: Item) Symbol {
-        return .{ .ns = ns, .item = item };
-    }
-};
-
-const Stack = struct {
+pub const Stack = struct {
     height: Offset = 0,
     max_height: Offset = 0,
     meta: std.ArrayListUnmanaged(Meta) = .{},
@@ -122,7 +123,7 @@ const Stack = struct {
     };
 };
 
-const Regs = struct {
+pub const Regs = struct {
     frees: [254]Id = undefined,
     free_count: u8 = 0,
     next: u8,
@@ -132,29 +133,29 @@ const Regs = struct {
 
     allocs: if (debug) [10]AllocData else void = undefined,
     alloc_count: if (debug) u8 else void = if (debug) 0,
-    const Id = u8;
-    const zero = 0;
-    const ret = 1;
-    const ret_addr = 31;
-    const stack_ptr = 254;
+    pub const Id = u8;
+    pub const zero = 0;
+    pub const ret = 1;
+    pub const ret_addr = 31;
+    pub const stack_ptr = 254;
 
     const AllocData = struct {
         id: Id,
         trace: root.StaticTrace,
     };
 
-    fn init(start: u8, end: u8) Regs {
+    pub fn init(start: u8, end: u8) Regs {
         return .{ .next = start, .max = end, .min = start };
     }
 
-    fn allocRet(self: *Regs) ?Id {
+    pub fn allocRet(self: *Regs) ?Id {
         if (self.ret_used) return null;
         if (debug) self.addAlloc(@returnAddress(), ret);
         self.ret_used = true;
         return ret;
     }
 
-    fn alloc(self: *Regs) Id {
+    pub fn alloc(self: *Regs) Id {
         if (self.free_count != 0) {
             self.free_count -= 1;
             if (debug) self.addAlloc(@returnAddress(), self.frees[self.free_count]);
@@ -166,7 +167,7 @@ const Regs = struct {
         return self.next;
     }
 
-    fn addAlloc(self: *Regs, return_addr: usize, reg: Id) void {
+    pub fn addAlloc(self: *Regs, return_addr: usize, reg: Id) void {
         self.allocs[self.alloc_count] = .{
             .id = reg,
             .trace = root.StaticTrace.init(return_addr),
@@ -174,7 +175,7 @@ const Regs = struct {
         self.alloc_count += 1;
     }
 
-    fn free(self: *Regs, reg: Id) void {
+    pub fn free(self: *Regs, reg: Id) void {
         if (debug) {
             for (self.frees[0..self.free_count]) |r| {
                 std.debug.assert(r != reg);
@@ -197,7 +198,7 @@ const Regs = struct {
         self.free_count += 1;
     }
 
-    fn checkLeaks(self: *Regs) void {
+    pub fn checkLeaks(self: *Regs) void {
         if (debug) {
             for (self.allocs[0..self.alloc_count]) |*alloc_data| {
                 std.debug.print("leaked reg: {d}\n", .{alloc_data.id});
@@ -222,7 +223,7 @@ const ItemCtx = struct {
     };
 };
 
-const Loc = struct {
+pub const Loc = struct {
     flags: packed struct(u8) {
         is_comptime: bool = false,
         is_derefed: bool = false,
@@ -239,29 +240,29 @@ const Loc = struct {
         offset: Offset,
     };
 
-    fn hasConsecutiveRegs(self: Loc) bool {
+    pub fn hasConsecutiveRegs(self: Loc) bool {
         std.debug.assert(self.sec_reg != 0);
         return self.reg == self.sec_reg -| 1;
     }
 
-    fn toggled(self: Loc, comptime flag: []const u8, value: bool) Loc {
+    pub fn toggled(self: Loc, comptime flag: []const u8, value: bool) Loc {
         var loc = self;
         std.debug.assert(@field(loc.flags, "is_" ++ flag) != value);
         @field(loc.flags, "is_" ++ flag) = value;
         return loc;
     }
 
-    fn offseted(self: Loc, by: Offset) Loc {
+    pub fn offseted(self: Loc, by: Offset) Loc {
         var loc = self;
         loc.offset += by;
         return loc;
     }
 
-    fn psi(self: Loc, offset: Offset) i64 {
+    pub fn psi(self: Loc, offset: Offset) i64 {
         return @bitCast(PackedStack{ .id = self.stack, .offset = self.offset + offset });
     }
 
-    fn psu(self: Loc, offset: Offset) u64 {
+    pub fn psu(self: Loc, offset: Offset) u64 {
         return @bitCast(PackedStack{ .id = self.stack, .offset = self.offset + offset });
     }
 };
@@ -518,7 +519,7 @@ fn emit(self: *Codegen, comptime op: isa.Op, args: anytype) !void {
     try self.output.code.appendSlice(self.gpa, &isa.pack(op, args));
 }
 
-fn catchUnreachable(res: anytype) Error!?@typeInfo(@TypeOf(res)).ErrorUnion.payload {
+pub fn catchUnreachable(res: anytype) Error!?@typeInfo(@TypeOf(res)).ErrorUnion.payload {
     return res catch |e| switch (e) {
         error.Return, error.LoopControl => null,
         else => e,
@@ -1370,7 +1371,7 @@ fn freeStack(self: *Codegen, stack: Stack.Id) void {
     }
 }
 
-fn buty(ty: Lexer.Lexeme) Ty {
+pub fn buty(ty: Lexer.Lexeme) Ty {
     return Ty.init(.builtin, @intFromEnum(ty));
 }
 
@@ -1578,7 +1579,7 @@ fn testCodegen(comptime name: []const u8, code: []const u8) !void {
     try not_terminated;
 }
 
-fn testFmt(comptime name: []const u8, path: []const u8, code: []const u8) !void {
+pub fn testFmt(comptime name: []const u8, path: []const u8, code: []const u8) !void {
     const gpa = std.testing.allocator;
 
     var ast = try Ast.init(path, code, gpa);
@@ -1609,7 +1610,7 @@ fn testFmt(comptime name: []const u8, path: []const u8, code: []const u8) !void 
     try err;
 }
 
-fn runDiff(gpa: std.mem.Allocator, old: []const u8, new: []const u8) !void {
+pub fn runDiff(gpa: std.mem.Allocator, old: []const u8, new: []const u8) !void {
     var child = std.process.Child.init(&.{ "diff", "--unified", "--color", old, new }, gpa);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
