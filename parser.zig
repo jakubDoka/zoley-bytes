@@ -106,7 +106,7 @@ pub const Expr = union(Kind) {
     If: struct {
         pos: Pos,
         cond: Id,
-        body: Id,
+        then: Id,
         else_: Id,
     },
     Loop: struct {
@@ -359,7 +359,7 @@ const Parser = struct {
             .@"if" => .{ .If = .{
                 .pos = Pos.init(token.pos),
                 .cond = try self.parseExpr(),
-                .body = try self.parseExpr(),
+                .then = try self.parseExpr(),
                 .else_ = if (self.tryAdvance(.@"else"))
                     try self.parseExpr()
                 else
@@ -639,7 +639,7 @@ const Fmt = struct {
                 try self.buf.appendSlice("if ");
                 try self.fmtExpr(i.cond);
                 try self.buf.appendSlice(" ");
-                try self.fmtExpr(i.body);
+                try self.fmtExpr(i.then);
                 if (i.else_.tag() != .Void) {
                     try self.buf.appendSlice(" else ");
                     try self.fmtExpr(i.else_);

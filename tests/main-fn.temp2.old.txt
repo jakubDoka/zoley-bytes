@@ -1,3 +1,9 @@
+IR
+b0:
+	v0 = Li64 42
+	ret v0
+
+
 DISASM
 addi64   $254, $254, 0
 li64     $1, 42

@@ -4,7 +4,9 @@ tmp: struct {
     todo: Alu(Ty) = .{},
     scratch: Alu(Ty) = .{},
     variables: Alu(Value) = .{},
-    values: Alu(Id) = .{},
+    values: Alu(Instr.Id) = .{},
+    loops: Alu(Loop) = .{},
+    loop_breaks: Alu(Cfg.Id) = .{},
 } = .{},
 ctx: struct {
     structs: Alu(Struct) = .{},
@@ -14,11 +16,12 @@ ctx: struct {
 } = .{},
 scope: struct {
     ret: Ty = undefined,
-    entry: ?Id = null,
-    returning: ?Id = null,
+    is_else: bool = false,
+    entry: ?Cfg.Id = null,
+    returning: ?Cfg.Id = null,
 } = .{},
 out: struct {
-    store: Store = .{},
+    store: Ir = .{},
     errors: Alu(u8) = .{},
 } = .{},
 
@@ -47,41 +50,246 @@ pub const buty = codegen.buty;
 
 const Codegen = @This();
 
-pub const Error = error{ Return, LoopControl, TooLongTuple } || std.mem.Allocator.Error;
-pub const Id = root.EnumId(Kind);
-pub const Slice = root.EnumSlice(Id);
-pub const Store = root.EnumStore(Id, Instr);
+pub const Error = error{ Return, LoopControl, NoRet, TooLongTuple } || std.mem.Allocator.Error;
 
 const root_file = 0;
 
-pub const Kind = enum {
+pub const CfgKind = enum {
     Void,
-    Arg,
-    Li64,
-    Add64,
-    Sub64,
-    Mul64,
-    Div64,
     Call,
+    Goto,
+    If,
     Ret,
 };
 
-pub const Instr = union(Kind) {
+pub const Cfg = union(CfgKind) {
+    Void,
+    Call: struct {
+        func: Ty,
+        args: Instr.Slice,
+        goto: Id = undefined,
+    },
+    Goto: Goto,
+    If: struct {
+        cond: Instr.Id,
+        then: Goto = .{},
+        else_: Goto = undefined,
+    },
+    Ret: Instr.Id,
+
+    pub const Id = root.EnumId(CfgKind);
+
+    pub const Goto = struct {
+        to: Id = Id.zeroSized(.Void),
+        args: Instr.Slice = undefined,
+    };
+};
+
+pub const InstrKind = enum {
+    Void,
+    Arg,
+    Li64,
+    @"+64",
+    @"-64",
+    @"*64",
+    @"/64",
+    @"<=64",
+    @"==64",
+    Call,
+};
+
+pub const Instr = union(InstrKind) {
     Void,
     Arg,
     Li64: u64,
-    Add64: BinOp,
-    Sub64: BinOp,
-    Mul64: BinOp,
-    Div64: BinOp,
-    Call: struct {
-        func: Ty,
-        args: Slice,
-        goto: Id = undefined,
-    },
-    Ret: Id,
+    @"+64": BinOp,
+    @"-64": BinOp,
+    @"*64": BinOp,
+    @"/64": BinOp,
+    @"<=64": BinOp,
+    @"==64": BinOp,
+    Call: Cfg.Id,
+
+    pub const Id = root.EnumId(InstrKind);
+    pub const Slice = packed struct(u32) {
+        base: u25 = 0,
+        len: u7 = 0,
+    };
 
     const BinOp = struct { lhs: Id, rhs: Id };
+};
+
+pub const Ir = struct {
+    instrs: root.TaglessEnumStore(Instr.Id, Instr) = .{},
+    instr_rcs: Alu(u16) = .{},
+    args: Alu(Instr.Id) = .{},
+    cfg: root.TaglessEnumStore(Cfg.Id, Cfg) = .{},
+    dom_tree: Alu(Cfg.Id) = .{},
+    cfg_rcs: Alu(u16) = .{},
+
+    pub fn view(self: *const Ir, args: Instr.Slice) []const Instr.Id {
+        return self.args.items[args.base..][0..args.len];
+    }
+
+    fn allocSlice(self: *Ir, gpa: std.mem.Allocator, slice: []const Instr.Id) !Instr.Slice {
+        const base = self.args.items.len;
+        try self.args.appendSlice(gpa, slice);
+        return .{ .base = @intCast(base), .len = @intCast(slice.len) };
+    }
+
+    pub fn deinit(self: *Ir, gpa: std.mem.Allocator) void {
+        inline for (std.meta.fields(Ir)) |field| {
+            @field(self, field.name).deinit(gpa);
+        }
+    }
+
+    pub fn computeDomTree(self: *Ir, gpa: std.mem.Allocator, entry: Cfg.Id) !void {
+        try self.computeCfgRcs(gpa, entry);
+        try self.dom_tree.resize(gpa, self.cfg.store.items.len);
+        for (self.dom_tree.items) |*dom| dom.* = Cfg.Id.compact(.Void, self.cfg_rcs.items.len);
+        self.computeDomTreeRec(entry);
+    }
+
+    pub fn display(self: *Ir, gpa: std.mem.Allocator, entry: Cfg.Id, out: *std.ArrayList(u8)) !void {
+        try self.computeDomTree(gpa, entry);
+
+        var bd = struct {
+            out: *std.ArrayList(u8),
+            ir: *const Ir,
+
+            pub fn addBlock(s: *@This(), block: Cfg.Id) !void {
+                try s.out.writer().print("b{d}:\n", .{block.index});
+                switch (s.ir.cfg.get(block)) {
+                    .Void => {},
+                    .Ret => |r| {
+                        try s.displayInstr(r);
+                        try s.out.writer().print("\tret v{d}", .{r.index});
+                    },
+                    .Goto => |g| {
+                        try s.out.writer().print("\tgoto b{d}", .{g.to.index});
+                        for (s.ir.view(g.args)) |arg| try s.out.writer().print(", v{d}", .{arg.index});
+                    },
+                    .If => |i| {
+                        try s.displayInstr(i.cond);
+                        try s.out.writer().print(
+                            "\tif v{d} b{d} b{d}",
+                            .{ i.cond.index, i.then.to.index, i.else_.to.index },
+                        );
+                    },
+                    .Call => |c| {
+                        for (s.ir.view(c.args)) |arg| try s.displayInstr(arg);
+                        try s.out.writer().print("\tcall :f{d}", .{c.func.index});
+                        for (s.ir.view(c.args)) |arg| try s.out.writer().print(", v{d}", .{arg.index});
+                    },
+                }
+                try s.out.appendSlice("\n\n");
+            }
+
+            pub fn displayInstr(s: *@This(), instr: Instr.Id) !void {
+                switch (s.ir.instrs.get(instr)) {
+                    .Void => {},
+                    .Arg => try s.out.writer().print("\tv{d} = arg {d}\n", .{ instr.index, instr.index }),
+                    inline .Li64 => |l, t| try s.out.writer().print(
+                        "\tv{d} = {s} {d}\n",
+                        .{ instr.index, @tagName(t), l },
+                    ),
+                    .Call => |c| try s.out.writer().print("\tv{d} = ret b{d}\n", .{ instr.index, c.index }),
+                    inline else => |v, t| {
+                        try s.displayInstr(v.lhs);
+                        try s.displayInstr(v.rhs);
+                        try s.out.writer().print(
+                            "\tv{d} = {s} v{d}, v{d}\n",
+                            .{ instr.index, @tagName(t), v.lhs.index, v.rhs.index },
+                        );
+                    },
+                }
+            }
+        }{ .out = out, .ir = self };
+        try self.traverseBlocks(entry, &bd);
+    }
+
+    // for child in graph[node]:
+    //     if brefs[child] != -1: return
+    //     if ref_counts[child] > 1:
+    //         cursor = node
+    //         while len(graph[brefs[cursor]]) == 1:
+    //             cursor = brefs[cursor]
+    //         brefs[child] = brefs[cursor]
+    //     else: brefs[child] = node
+    //     dfs(child)
+    pub fn computeDomTreeRec(self: *Ir, id: Cfg.Id) void {
+        var buf: [2]Cfg.Id = undefined;
+        for (self.nextCfgNodes(id, &buf)) |child| {
+            if (self.dom_tree.items[id.index].index != self.cfg_rcs.items.len) return;
+            if (self.cfg_rcs.items[id.index] > 1) {
+                var cursor = id;
+                var tbuf: [2]Cfg.Id = undefined;
+                while (self.nextCfgNodes(self.dom_tree.items[cursor.index], &tbuf).len == 1)
+                    cursor = self.dom_tree.items[cursor.index];
+                self.dom_tree.items[child.index] = self.dom_tree.items[cursor.index];
+            } else self.dom_tree.items[child.index] = id;
+        }
+    }
+
+    pub fn traverseBlocks(self: *Ir, entry: Cfg.Id, ctx: anytype) !void {
+        std.debug.assert(self.cfg_rcs.items.len == self.cfg.store.items.len);
+        std.debug.assert(self.dom_tree.items.len == self.cfg.store.items.len);
+        try self.traverseBlocksRec(entry, ctx);
+    }
+
+    // if seen[node]: return
+    // seen[node] = True
+    // order.append(node)
+
+    // for child in graph[node]:
+    //     if dominators[child] != node and ref_counts[child] != 1:
+    //         ref_counts[child] -= 1
+    //         return
+    //     dfs(child)
+    fn traverseBlocksRec(self: *Ir, id: Cfg.Id, ctx: anytype) !void {
+        try ctx.addBlock(id);
+        var buf: [2]Cfg.Id = undefined;
+        for (self.nextCfgNodes(id, &buf)) |child| {
+            if (self.dom_tree.items[child.index].index != id.index and
+                self.cfg_rcs.items[child.index] != 1)
+            {
+                self.cfg_rcs.items[id.index] -= 1;
+                return;
+            }
+            try self.traverseBlocksRec(child, ctx);
+        }
+    }
+
+    pub fn computeCfgRcs(self: *Ir, gpa: std.mem.Allocator, entry: Cfg.Id) !void {
+        try self.cfg_rcs.resize(gpa, self.cfg.store.items.len);
+        @memset(self.cfg_rcs.items, 0);
+        self.computeCfgRcsRec(entry);
+    }
+
+    fn computeCfgRcsRec(self: *Ir, id: Cfg.Id) void {
+        self.cfg_rcs.items[id.index] += 1;
+        if (self.cfg_rcs.items[id.index] != 1) return;
+        var buf: [2]Cfg.Id = undefined;
+        for (self.nextCfgNodes(id, &buf)) |child| self.computeCfgRcsRec(child);
+    }
+
+    fn nextCfgNodes(self: *Ir, id: Cfg.Id, buf: *[2]Cfg.Id) []const Cfg.Id {
+        return switch (self.cfg.get(id)) {
+            .Void, .Ret => &.{},
+            .Call => |call| b: {
+                buf[0] = call.goto;
+                break :b buf[0..1];
+            },
+            .Goto => |goto| b: {
+                buf[0] = goto.to;
+                break :b buf[0..1];
+            },
+            .If => |ifNode| b: {
+                buf.* = .{ ifNode.then.to, ifNode.else_.to };
+                break :b buf;
+            },
+        };
+    }
 };
 
 pub const Func = struct {
@@ -89,12 +297,18 @@ pub const Func = struct {
     args: Tuple,
     ret: Ty,
     decl: Ast.Id,
-    entry: Id = undefined,
+    entry: Cfg.Id = undefined,
+    ir: Ir = undefined,
+};
+
+const Loop = struct {
+    back: Cfg.Id,
+    break_base: u32,
 };
 
 const Value = struct {
     ty: Ty = buty(.void),
-    id: Id = Id.zeroSized(.Void),
+    id: Instr.Id = Instr.Id.zeroSized(.Void),
 };
 
 pub fn deinit(self: *Codegen) void {
@@ -141,21 +355,23 @@ fn generateFunc(self: *Codegen, id: usize) !void {
     for (func.args.view(self.ctx.allocated.items), 0..) |arg_ty, i| {
         try self.tmp.variables.append(self.gpa, .{
             .ty = arg_ty,
-            .id = Id.compact(.Arg, @intCast(i)),
+            .id = Instr.Id.compact(.Arg, @intCast(i)),
         });
     }
     const last_return = try self.catchUnreachable(self.generateExpr(func.file, null, decl.body));
     self.ctx.funcs.items[id].entry = self.scope.entry orelse last_return;
+    self.ctx.funcs.items[id].ir = self.out.store;
+    self.out.store = .{};
     self.tmp.variables.items.len = 0;
 }
 
-fn catchUnreachable(self: *Codegen, res: anytype) Error!Id {
+fn catchUnreachable(self: *Codegen, res: anytype) Error!Cfg.Id {
     _ = res catch |e| switch (e) {
         error.Return, error.LoopControl => return self.scope.returning.?,
         else => return e,
     };
 
-    return error.OutOfMemory;
+    return error.NoRet;
 }
 
 fn generateExpr(self: *Codegen, file: File, inferred: ?Ty, id: Ast.Id) Error!Value {
@@ -163,7 +379,7 @@ fn generateExpr(self: *Codegen, file: File, inferred: ?Ty, id: Ast.Id) Error!Val
     const gi, const ty = switch (ast.exprs.get(id)) {
         .Void, .Comment => return .{},
         .Return => |ret| {
-            self.passControlFlow(try self.out.store.alloc(
+            try self.passControlFlow(try self.out.store.cfg.alloc(
                 self.gpa,
                 .Ret,
                 (try self.generateExpr(file, self.scope.ret, ret.value)).id,
@@ -175,20 +391,9 @@ fn generateExpr(self: *Codegen, file: File, inferred: ?Ty, id: Ast.Id) Error!Val
             for (ast.exprs.view(block.stmts)) |stmt| {
                 _ = try self.generateExpr(file, null, stmt);
             }
-            unreachable;
+            return .{};
         },
-        .BinOp => |op| b: {
-            const lhs = try self.generateExpr(file, inferred, op.lhs);
-            const rhs = try self.generateExpr(file, lhs.ty, op.rhs);
-            const body = .{ .lhs = lhs.id, .rhs = rhs.id };
-            break :b .{ switch (op.op) {
-                .@"+" => Instr{ .Add64 = body },
-                .@"-" => Instr{ .Sub64 = body },
-                .@"*" => Instr{ .Mul64 = body },
-                .@"/" => Instr{ .Div64 = body },
-                else => std.debug.panic("unhandled binop: {s}", .{@tagName(op.op)}),
-            }, rhs.ty };
-        },
+        .BinOp => |bo| return self.generateBinOp(file, bo, inferred),
         .Call => |call| {
             const called = ast.exprs.getTyped(.Ident, call.called).?;
             const func_id = try self.findOrDeclare(called.pos, file, called.id);
@@ -201,26 +406,146 @@ fn generateExpr(self: *Codegen, file: File, inferred: ?Ty, id: Ast.Id) Error!Val
                 try self.tmp.values.append(self.gpa, value.id);
             }
             const base = self.tmp.values.items.len - ast.exprs.view(call.args).len;
-            const args = try self.out.store.allocSlice(Id, self.gpa, self.tmp.values.items[base..]);
+            const args = try self.out.store.allocSlice(self.gpa, self.tmp.values.items[base..]);
             self.tmp.values.items.len = base;
-            const cid = try self.out.store.alloc(self.gpa, .Call, .{ .args = args, .func = func_id });
-            self.passControlFlow(cid);
-            return .{ .ty = func.ret, .id = cid };
+            const cid = try self.out.store.cfg.alloc(self.gpa, .Call, .{ .args = args, .func = func_id });
+            try self.passControlFlow(cid);
+            const icid = try self.out.store.instrs.alloc(self.gpa, .Call, cid);
+            return .{ .ty = func.ret, .id = icid };
         },
         .Ident => |i| return self.tmp.variables.items[i.id.index],
+        .If => |i| {
+            const cond = try self.generateExpr(file, buty(.bool), i.cond);
+            const ifNode = try self.out.store.cfg.alloc(self.gpa, .If, .{ .cond = cond.id });
+            try self.passControlFlow(ifNode);
+
+            const join = try self.out.store.cfg.alloc(self.gpa, .Goto, .{});
+            const thenReachable = try catchIfBranch(self.generateExpr(file, null, i.then));
+            if (thenReachable) try self.passControlFlow(join);
+
+            self.scope.returning = ifNode;
+            const elseReachable = try catchIfBranch(self.generateExpr(file, null, i.else_));
+            if (elseReachable) try self.passControlFlow(join);
+
+            if (!thenReachable and !elseReachable) return error.Return;
+
+            return .{};
+        },
+        .Loop => |l| {
+            const back = try self.out.store.cfg.alloc(self.gpa, .Goto, .{ .args = .{} });
+            try self.tmp.loops.append(self.gpa, .{
+                .back = back,
+                .break_base = @intCast(self.tmp.loop_breaks.items.len),
+            });
+            _ = try self.passControlFlow(back);
+
+            const loopReachabe = try catchIfBranch(self.generateExpr(file, null, l.body));
+            if (loopReachabe)
+                try self.passControlFlow(try self.out.store.cfg.alloc(
+                    self.gpa,
+                    .Goto,
+                    .{ .to = back, .args = .{} },
+                ));
+
+            const loop = self.tmp.loops.pop();
+            const breaks = self.tmp.loop_breaks.items[loop.break_base..];
+            self.tmp.loop_breaks.items.len = loop.break_base;
+            if (breaks.len != 0) {
+                const breaker = try self.out.store.cfg.alloc(self.gpa, .Goto, .{ .args = .{} });
+                self.scope.returning = breaker;
+                for (breaks) |break_id| {
+                    self.out.store.cfg.getTypedPtr(.Goto, break_id).?.to = breaker;
+                    std.debug.print("breaked {any}\n", .{break_id});
+                }
+                return .{};
+            } else {
+                return error.Return;
+            }
+        },
+        .Break => {
+            std.debug.assert(self.tmp.loops.items.len != 0);
+            const break_block = try self.out.store.cfg.alloc(self.gpa, .Goto, .{ .args = .{} });
+            _ = try self.passControlFlow(break_block);
+            try self.tmp.loop_breaks.append(self.gpa, break_block);
+            return error.LoopControl;
+        },
+        .Continue => {
+            const loop = self.tmp.loops.getLast();
+            _ = try self.passControlFlow(try self.out.store.cfg.alloc(
+                self.gpa,
+                .Goto,
+                .{ .to = loop.back, .args = .{} },
+            ));
+            return error.LoopControl;
+        },
         else => |v| std.debug.panic("unhandled expr: {any}", .{v}),
     };
-    return .{ .ty = ty, .id = try self.out.store.allocDyn(self.gpa, gi) };
+    return .{ .ty = ty, .id = try self.out.store.instrs.allocDyn(self.gpa, gi) };
 }
 
-fn passControlFlow(self: *Codegen, id: Id) void {
+fn generateBinOp(self: *Codegen, file: File, bo: Ast.Payload(.BinOp), inferred: ?Ty) !Value {
+    const ast = self.files[file];
+    switch (bo.op) {
+        .@":=" => {
+            _ = ast.exprs.getTyped(.Ident, bo.lhs).?;
+            const value = try self.generateExpr(file, inferred, bo.rhs);
+            try self.tmp.variables.append(self.gpa, value);
+            return .{};
+        },
+        .@"=" => {
+            const name = ast.exprs.getTyped(.Ident, bo.lhs).?;
+            const value = try self.generateExpr(file, inferred, bo.rhs);
+            self.tmp.variables.items[name.id.index] = value;
+            return .{};
+        },
+        inline .@"+=", .@"-=" => |op| {
+            const name = ast.exprs.getTyped(.Ident, bo.lhs).?;
+            const nop = .{ .lhs = bo.lhs, .op = op.assOp(), .rhs = bo.rhs };
+            const value = try self.generateBinOp(file, nop, inferred);
+            self.tmp.variables.items[name.id.index] = value;
+            return .{};
+        },
+        inline .@"+", .@"-", .@"*", .@"/", .@"<=", .@"==" => |op| {
+            const lhs = try self.generateExpr(file, inferred, bo.lhs);
+            const rhs = try self.generateExpr(file, lhs.ty, bo.rhs);
+            const body = .{ .lhs = lhs.id, .rhs = rhs.id };
+            return .{
+                .id = try self.out.store.instrs.allocDyn(
+                    self.gpa,
+                    @unionInit(Instr, @tagName(op) ++ "64", body),
+                ),
+                .ty = rhs.ty,
+            };
+        },
+        else => std.debug.panic("unhandled binop: {s}", .{@tagName(bo.op)}),
+    }
+}
+
+fn catchIfBranch(res: anytype) !bool {
+    _ = res catch |e| switch (e) {
+        error.Return, error.LoopControl => return false,
+        else => return e,
+    };
+
+    return true;
+}
+
+fn passControlFlow(self: *Codegen, id: Cfg.Id) !void {
     self.scope.entry = self.scope.entry orelse id;
     if (self.scope.returning) |retr| switch (retr.tag()) {
+        .If => {
+            const p = self.out.store.cfg.getTypedPtr(.If, retr).?;
+            if (p.then.to.tag() == .Void) p.then.to = id else p.else_.to = id;
+        },
+        .Goto => {
+            const p = self.out.store.cfg.getTypedPtr(.Goto, retr).?;
+            p.to = id;
+        },
         inline else => |t| {
-            const Payload = std.meta.TagPayload(Instr, t);
-            if (@typeInfo(Payload) != .Struct or !@hasField(Payload, "goto")) unreachable;
+            const Payload = std.meta.TagPayload(Cfg, t);
+            if (@typeInfo(Payload) != .Struct or !@hasField(Payload, "goto")) std.debug.panic("wat {s}", .{@typeName(Payload)});
             std.debug.assert(!std.meta.eql(retr, id));
-            self.out.store.getTypedPtr(t, retr).?.goto = id;
+            self.out.store.cfg.getTypedPtr(t, retr).?.goto = id;
         },
     };
     self.scope.returning = id;
@@ -401,8 +726,10 @@ fn testCodegen(comptime name: []const u8, source: []const u8) !void {
     defer code.deinit();
 
     var vm_codegen = HbvmCg{ .gpa = gpa, .cg = &cg, .out = &code };
-    defer vm_codegen.deinit(gpa);
-    for (0..cg.ctx.funcs.items.len) |id| {
+    defer vm_codegen.deinit();
+    try output.writer().print("\nIR\n", .{});
+    for (cg.ctx.funcs.items, 0..) |*f, id| {
+        try f.ir.display(gpa, f.entry, &output);
         try vm_codegen.generateFunc(id);
     }
     vm_codegen.finalize();
@@ -487,4 +814,16 @@ test "functions" {
 
 test "comments" {
     try runTest("comments");
+}
+
+test "if-statements" {
+    try runTest("if-statements");
+}
+
+test "variables" {
+    try runTest("variables");
+}
+
+test "loops" {
+    try runTest("loops");
 }

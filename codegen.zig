@@ -580,9 +580,9 @@ fn generateExpr(self: *Codegen, file: File, ctx: Ctx, id: Ast.Id) Error!Value {
 
             const cond_jump_offset = self.localOffset() - cond_op_ctx.size;
             const then, const else_ = if (cond_op_ctx.invert)
-                .{ i.else_, i.body }
+                .{ i.else_, i.then }
             else
-                .{ i.body, i.else_ };
+                .{ i.then, i.else_ };
             if (cond_op_ctx.size == 0) {
                 try self.emit(.jeq, .{ cond.loc.reg, 0, 0 });
                 self.freeValue(cond);

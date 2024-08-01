@@ -30,10 +30,78 @@ pub fn EnumId(comptime Tag: type) type {
 
 pub fn EnumSlice(comptime T: type) type {
     return struct {
+        start: u32 = 0,
+        end: u32 = 0,
+
         const Elem = T;
 
-        start: u32,
-        end: u32,
+        pub fn isEmpty(self: @This()) bool {
+            return self.start == self.end;
+        }
+    };
+}
+
+pub fn TaglessEnumStore(comptime SelfId: type, comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const Elem = b: {
+            var data = @typeInfo(T);
+            data.Union.tag_type = null;
+            data.Union.decls = &.{};
+            break :b @Type(data);
+        };
+
+        store: std.ArrayListUnmanaged(Elem) = .{},
+
+        pub fn allocDyn(self: *Self, gpa: std.mem.Allocator, value: T) !SelfId {
+            return switch (value) {
+                inline else => |v, t| try self.alloc(gpa, t, v),
+            };
+        }
+
+        pub fn alloc(
+            self: *Self,
+            gpa: std.mem.Allocator,
+            comptime tag: std.meta.Tag(T),
+            value: std.meta.TagPayload(T, tag),
+        ) !SelfId {
+            try self.store.append(gpa, @unionInit(Elem, @tagName(tag), value));
+            return SelfId{
+                .taga = @intFromEnum(tag),
+                .index = @intCast(self.store.items.len - 1),
+            };
+        }
+
+        pub fn get(self: *const Self, id: SelfId) T {
+            switch (@as(std.meta.Tag(T), @enumFromInt(id.taga))) {
+                inline else => |t| {
+                    const field = if (std.meta.TagPayload(T, t) == void) {} else @field(self.store.items[id.index], @tagName(t));
+                    return @unionInit(T, @tagName(t), field);
+                },
+            }
+        }
+
+        pub fn getTyped(
+            self: *const Self,
+            comptime tag: std.meta.Tag(T),
+            id: SelfId,
+        ) ?std.meta.TagPayload(T, tag) {
+            if (tag != id.tag()) return null;
+            return @field(self.store.items[id.index], @tagName(tag));
+        }
+
+        pub fn getTypedPtr(
+            self: *Self,
+            comptime tag: std.meta.Tag(T),
+            id: SelfId,
+        ) ?*std.meta.TagPayload(T, tag) {
+            if (tag != id.tag()) return null;
+            return &@field(self.store.items[id.index], @tagName(tag));
+        }
+
+        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            self.store.deinit(gpa);
+        }
     };
 }
 

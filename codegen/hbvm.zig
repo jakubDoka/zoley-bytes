@@ -2,9 +2,14 @@ gpa: std.mem.Allocator,
 cg: *Codegen,
 out: *std.ArrayList(u8),
 
-next_block: Codegen.Id = undefined,
+ir: Codegen.Ir = undefined,
 regs: Regs = undefined,
-computed: std.AutoHashMapUnmanaged(Codegen.Id, Loc) = .{},
+block_order: std.ArrayListUnmanaged(Codegen.Cfg.Id) = .{},
+computed: std.ArrayListUnmanaged(Loc) = .{},
+block_offsets: std.ArrayListUnmanaged(u32) = .{},
+goto_relocs: std.ArrayListUnmanaged(GotoReloc) = .{},
+if_relocs: std.ArrayListUnmanaged(IfReloc) = .{},
+ret_relocs: std.ArrayListUnmanaged(u32) = .{},
 args: std.ArrayListUnmanaged(Loc) = .{},
 tmp_locs: std.ArrayListUnmanaged(Loc) = .{},
 funcs: std.ArrayListUnmanaged(Func) = .{},
@@ -23,6 +28,16 @@ pub const Loc = codegen.Loc;
 pub const Regs = codegen.Regs;
 pub const Error = error{Goto} || std.mem.Allocator.Error;
 
+const GotoReloc = struct {
+    to: Codegen.Cfg.Id,
+    offset: u32,
+};
+
+const IfReloc = struct {
+    to: Codegen.Cfg.Id,
+    offset: u32,
+};
+
 const FuncReloc = struct {
     func: u32,
     offset: u32,
@@ -33,13 +48,22 @@ const Func = struct {
     reloc_end: u32,
 };
 
-pub fn deinit(self: *HbvmCg, gpa: std.mem.Allocator) void {
-    self.computed.deinit(gpa);
-    self.args.deinit(gpa);
-    self.funcs.deinit(gpa);
-    self.relocs.funcs.deinit(gpa);
+pub fn deinit(self: *HbvmCg) void {
+    std.debug.assert(self.block_order.items.len == 0);
+    self.block_order.deinit(self.gpa);
+    std.debug.assert(self.ret_relocs.items.len == 0);
+    self.ret_relocs.deinit(self.gpa);
+    std.debug.assert(self.goto_relocs.items.len == 0);
+    self.goto_relocs.deinit(self.gpa);
+    std.debug.assert(self.if_relocs.items.len == 0);
+    self.if_relocs.deinit(self.gpa);
+    self.computed.deinit(self.gpa);
+    self.args.deinit(self.gpa);
+    self.funcs.deinit(self.gpa);
+    self.relocs.funcs.deinit(self.gpa);
     std.debug.assert(self.tmp_locs.items.len == 0);
-    self.tmp_locs.deinit(gpa);
+    self.tmp_locs.deinit(self.gpa);
+    self.block_offsets.deinit(self.gpa);
 }
 
 pub fn generateFunc(self: *HbvmCg, func_id: usize) !void {
@@ -47,6 +71,10 @@ pub fn generateFunc(self: *HbvmCg, func_id: usize) !void {
     const func = &self.cg.ctx.funcs.items[func_id];
     const entry = func_id == 0;
     const base = self.out.items.len;
+    self.ir = func.ir;
+    defer self.ir.deinit(self.gpa);
+    try self.computed.resize(self.gpa, self.ir.cfg.store.items.len);
+    try self.block_offsets.resize(self.gpa, self.ir.cfg.store.items.len);
 
     try self.emit(.addi64, .{ Regs.stack_ptr, Regs.stack_ptr, 0 });
     if (!entry) try self.emit(.st, .{ Regs.ret_addr, Regs.stack_ptr, 0, 0 });
@@ -81,22 +109,40 @@ pub fn generateFunc(self: *HbvmCg, func_id: usize) !void {
         };
     }
 
-    self.next_block = func.entry;
-    for (0..10000) |_| {
-        _ = self.generate(null, self.next_block) catch |e| switch (e) {
-            error.Goto => {
-                continue;
-            },
-            else => return e,
-        };
-        break;
-    } else unreachable;
+    try self.ir.computeDomTree(self.gpa, func.entry);
+
+    try self.block_order.ensureTotalCapacity(self.gpa, self.ir.cfg.store.items.len);
+    var ctx = struct {
+        blocks: *std.ArrayListUnmanaged(Codegen.Cfg.Id),
+        pub fn addBlock(s: *@This(), id: Codegen.Cfg.Id) !void {
+            std.debug.print("block {d}\n", .{id.index});
+            s.blocks.appendAssumeCapacity(id);
+        }
+    }{ .blocks = &self.block_order };
+    try self.ir.traverseBlocks(func.entry, &ctx);
+    for (self.block_order.items, 0..) |id, i| {
+        try self.generateBlock(id, i);
+    }
+    self.block_order.items.len = 0;
+    std.debug.print("generated blocks\n", .{});
 
     for (self.args.items) |arg| self.freeValue(arg);
 
     self.regs.checkLeaks();
     const stack_size = 0;
     const poped_regs_size = self.regs.free_count * @as(u16, 8) + 8;
+
+    for (self.goto_relocs.items) |reloc|
+        self.writeReloc(i32, @intCast(reloc.offset + 1), @as(i32, @intCast(self.block_offsets.items[reloc.to.index])) - @as(i32, @intCast(reloc.offset)));
+    self.goto_relocs.items.len = 0;
+
+    for (self.if_relocs.items) |reloc|
+        self.writeReloc(i16, @intCast(reloc.offset + 3), @intCast(self.block_offsets.items[reloc.to.index] -% reloc.offset));
+    self.if_relocs.items.len = 0;
+
+    for (self.ret_relocs.items) |offset|
+        self.writeReloc(i32, @intCast(offset + 1), @intCast(self.out.items.len - offset));
+    self.ret_relocs.items.len = 0;
 
     if (entry) {
         self.writeReloc(u64, base + 3, 0 -% @as(u64, stack_size));
@@ -122,40 +168,22 @@ pub fn finalize(self: *HbvmCg) void {
     for (self.funcs.items) |func| {
         for (self.relocs.funcs.items[prev_start..func.reloc_end]) |reloc| {
             const dest_offset = self.funcs.items[reloc.func].base;
-            self.writeReloc(i32, reloc.offset + 3, @intCast(dest_offset - reloc.offset));
+            self.writeReloc(i32, reloc.offset + 3, @bitCast(dest_offset -% reloc.offset));
         }
         prev_start = func.reloc_end;
     }
 }
 
-fn generate(self: *HbvmCg, dst: ?Loc, id: Codegen.Id) !Loc {
-    return switch (self.cg.out.store.get(id)) {
-        .Void => .{},
-        .Arg => b: {
-            const loc = self.args.items[id.index].toggled("borrowed", true);
-            if (dst) |d| try self.emit(.cp, .{ d.reg, loc.reg });
-            break :b dst orelse loc;
-        },
-        .Li64 => |i| b: {
-            const loc = dst orelse Loc{ .reg = self.regs.alloc() };
-            try self.emit(.li64, .{ loc.reg, i });
-            break :b loc;
-        },
-        .Ret => |ret| b: {
-            const rdst = Loc{ .reg = 1, .flags = .{ .is_borrowed = true } };
-            self.freeValue(try self.generate(rdst, ret));
-            break :b .{};
-        },
+fn generateBlock(self: *HbvmCg, id: Codegen.Cfg.Id, idx: usize) !void {
+    self.block_offsets.items[id.index] = @intCast(self.out.items.len);
+    switch (self.ir.cfg.get(id)) {
+        .Void => unreachable,
         .Call => |call| {
-            if (self.computed.get(id)) |loc| {
-                return loc;
-            }
-
             std.debug.assert(call.func.tag() == .func);
             const func = self.cg.ctx.funcs.items[call.func.index];
             var arg_reg: Regs.Id = 2;
             for (
-                self.cg.out.store.view(call.args),
+                self.ir.view(call.args),
                 func.args.view(self.cg.ctx.allocated.items),
             ) |arg, arg_ty| {
                 const value = switch (self.cg.sizeOf(arg_ty)) {
@@ -163,7 +191,7 @@ fn generate(self: *HbvmCg, dst: ?Loc, id: Codegen.Id) !Loc {
                     8 => b: {
                         const arg_loc = Loc{ .reg = arg_reg, .flags = .{ .is_borrowed = true } };
                         arg_reg += 1;
-                        break :b try self.generate(arg_loc, arg);
+                        break :b try self.generateExpr(arg_loc, arg);
                     },
                     else => unreachable,
                 };
@@ -197,33 +225,90 @@ fn generate(self: *HbvmCg, dst: ?Loc, id: Codegen.Id) !Loc {
 
                     if (ret_temp) |r| try self.emit(.swa, .{ r, Regs.ret });
 
-                    try self.computed.put(self.gpa, id, .{ .reg = ret orelse ret_temp.? });
+                    self.computed.items[id.index] = .{ .reg = ret orelse ret_temp.? };
                 },
                 else => unreachable,
             }
-            self.next_block = call.goto;
-            return error.Goto;
         },
-        inline .Add64, .Sub64, .Mul64 => |body, t| b: {
-            const lhs = try self.generate(dst, body.lhs);
-            const rhs = try self.generate(null, body.rhs);
+        .Goto => |goto| {
+            // TODO: collect the ordering instead so that we can eliminate useles jumps
+            std.debug.assert(goto.args.len == 0);
+            if (!self.isBefore(idx, goto.to)) {
+                try self.goto_relocs.append(self.gpa, .{ .to = goto.to, .offset = @intCast(self.out.items.len) });
+                try self.emit(.jmp, .{0});
+            }
+        },
+        .If => |i| {
+            std.debug.assert(i.then.args.len == 0);
+            std.debug.assert(i.else_.args.len == 0);
+            switch (self.ir.instrs.get(i.cond)) {
+                inline .@"<=64", .@"==64" => |le, t| {
+                    const lhs = try self.generateExpr(null, le.lhs);
+                    defer self.freeValue(lhs);
+                    const rhs = try self.generateExpr(null, le.rhs);
+                    defer self.freeValue(rhs);
+                    std.debug.assert(!self.isBefore(idx, i.else_.to));
+                    try self.if_relocs.append(self.gpa, .{ .to = i.else_.to, .offset = @intCast(self.out.items.len) });
+                    const instr = switch (t) {
+                        .@"<=64" => .jgtu,
+                        .@"==64" => .jne,
+                        else => @compileError("wat"),
+                    };
+                    try self.emit(instr, .{ lhs.reg, rhs.reg, 0 });
+                },
+                else => unreachable,
+            }
+        },
+        .Ret => |ret| {
+            const rdst = Loc{ .reg = 1, .flags = .{ .is_borrowed = true } };
+            self.freeValue(try self.generateExpr(rdst, ret));
+            if (idx + 1 != self.block_order.items.len) {
+                try self.ret_relocs.append(self.gpa, @intCast(self.out.items.len));
+                try self.emit(.jmp, .{0});
+            }
+        },
+    }
+}
+
+fn isBefore(self: *HbvmCg, idx: usize, dest: Codegen.Cfg.Id) bool {
+    return idx + 1 < self.block_order.items.len and self.block_order.items[idx + 1].index == dest.index;
+}
+
+fn generateExpr(self: *HbvmCg, dst: ?Loc, id: Codegen.Instr.Id) !Loc {
+    return switch (self.ir.instrs.get(id)) {
+        .Void => .{},
+        .Arg => b: {
+            const loc = self.args.items[id.index].toggled("borrowed", true);
+            if (dst) |d| try self.emit(.cp, .{ d.reg, loc.reg });
+            break :b dst orelse loc;
+        },
+        .Li64 => |i| b: {
+            const loc = dst orelse Loc{ .reg = self.regs.alloc() };
+            try self.emit(.li64, .{ loc.reg, i });
+            break :b loc;
+        },
+        inline .@"+64", .@"-64", .@"*64" => |body, t| b: {
+            const lhs = try self.generateExpr(dst, body.lhs);
+            const rhs = try self.generateExpr(null, body.rhs);
             defer self.freeValue(rhs);
             const instr = switch (t) {
-                .Add64 => .add64,
-                .Sub64 => .sub64,
-                .Mul64 => .mul64,
+                .@"+64" => .add64,
+                .@"-64" => .sub64,
+                .@"*64" => .mul64,
                 else => @compileError("wat"),
             };
             try self.emit(instr, .{ lhs.reg, lhs.reg, rhs.reg });
             break :b lhs;
         },
-        .Div64 => |body| b: {
-            const lhs = try self.generate(dst, body.lhs);
-            const rhs = try self.generate(null, body.rhs);
+        .@"<=64", .@"==64" => unreachable,
+        .@"/64" => |body| b: {
+            const lhs = try self.generateExpr(dst, body.lhs);
+            const rhs = try self.generateExpr(null, body.rhs);
             defer self.freeValue(rhs);
             try self.emit(.diru64, .{ lhs.reg, 0, lhs.reg, rhs.reg });
             break :b lhs;
         },
+        .Call => |call| self.computed.items[call.index],
         //else => |v| std.debug.panic("unhandled expr: {any}", .{v}),
     };
 }
